@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import MediaReviewApp from "../app/MediaReviewApp";
@@ -78,6 +78,16 @@ function installFolderPicker(
     value: picker,
   });
   return picker;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
 }
 
 async function openFolderWith(items: MediaItem[]) {
@@ -270,10 +280,14 @@ describe("MediaReviewApp", () => {
     });
   });
 
-  it("最後の判定後は明示操作まで待ってからCSVを保存する", async () => {
+  it("保存中は多重実行と画面移動を防ぎ、完了後に操作を戻す", async () => {
+    const pendingSave = deferred<{
+      filename: string;
+      destination: "folder" | "download";
+    }>();
+    csvMocks.saveDecisionsCsv.mockReturnValue(pendingSave.promise);
     const item = mediaItem("only.jpg");
     const folder = await openFolderWith([item]);
-    const user = userEvent.setup();
 
     fireEvent.keyDown(window, { key: "ArrowRight" });
 
@@ -281,12 +295,36 @@ describe("MediaReviewApp", () => {
     expect(csvMocks.getWritableDirectoryHandle).not.toHaveBeenCalled();
     expect(csvMocks.saveDecisionsCsv).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole("button", { name: "CSVを保存" }));
+    const saveButton = screen.getByRole("button", { name: "CSVを保存" });
+    const undoButton = screen.getByRole("button", { name: "最後の判定に戻る" });
+    const folderButton = screen.getByRole("button", { name: "別のフォルダを選ぶ" });
+    act(() => {
+      saveButton.click();
+      saveButton.click();
+      undoButton.click();
+      folderButton.click();
+    });
 
-    await waitFor(() => expect(csvMocks.createCsvDecisionRows).toHaveBeenCalledOnce());
+    await waitFor(() => expect(csvMocks.saveDecisionsCsv).toHaveBeenCalledOnce());
+    expect(csvMocks.createCsvDecisionRows).toHaveBeenCalledOnce();
     expect(csvMocks.getWritableDirectoryHandle).toHaveBeenCalledWith(folder);
     expect(csvMocks.saveDecisionsCsv).toHaveBeenCalledWith(folder, [{ row: true }]);
-    expect(screen.getByText("media-decisions.csv")).toBeInTheDocument();
+    expect(window.showDirectoryPicker).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "CSVを保存中" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "最後の判定に戻る" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "別のフォルダを選ぶ" })).toBeDisabled();
+
+    await act(async () => {
+      pendingSave.resolve({
+        filename: "media-decisions.csv",
+        destination: "folder",
+      });
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByText("media-decisions.csv")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "最後の判定に戻る" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "別のフォルダを選ぶ" })).toBeEnabled();
   });
 
   it("書き込みを許可しない場合はダウンロード保存へ切り替える", async () => {
@@ -310,8 +348,12 @@ describe("MediaReviewApp", () => {
   });
 
   it("保存失敗後は再試行と表示し、権限をもう一度確認する", async () => {
+    const pendingSave = deferred<{
+      filename: string;
+      destination: "folder" | "download";
+    }>();
     csvMocks.saveDecisionsCsv
-      .mockRejectedValueOnce(new Error("save failed"))
+      .mockReturnValueOnce(pendingSave.promise)
       .mockResolvedValueOnce({
         filename: "media-decisions.csv",
         destination: "folder",
@@ -322,11 +364,21 @@ describe("MediaReviewApp", () => {
 
     fireEvent.keyDown(window, { key: "ArrowRight" });
     await user.click(await screen.findByRole("button", { name: "CSVを保存" }));
+    expect(screen.getByRole("button", { name: "CSVを保存中" })).toBeDisabled();
+
+    await act(async () => {
+      pendingSave.reject(new Error("save failed"));
+      await Promise.resolve();
+    });
+
     expect(
       await screen.findByText(
         "CSVを保存できませんでした。権限を確認して再試行してください。",
       ),
     ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "CSV保存を再試行" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "最後の判定に戻る" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "別のフォルダを選ぶ" })).toBeEnabled();
 
     await user.click(screen.getByRole("button", { name: "CSV保存を再試行" }));
 

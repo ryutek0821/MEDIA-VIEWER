@@ -164,6 +164,7 @@ export default function MediaReviewApp() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const dragStartRef = useRef<{ x: number; pointerId: number } | null>(null);
   const busyRef = useRef(false);
+  const saveInFlightRef = useRef(false);
 
   const currentItem = items[currentIndex] ?? null;
   const decisions = session?.decisions ?? EMPTY_DECISIONS;
@@ -300,6 +301,7 @@ export default function MediaReviewApp() {
   }, [beginNewReview, pendingFolder, resumeCandidate]);
 
   const chooseFolder = useCallback(async () => {
+    if (phase === "saving" || saveInFlightRef.current) return;
     if (!("showDirectoryPicker" in window)) {
       setSupported(false);
       return;
@@ -368,11 +370,12 @@ export default function MediaReviewApp() {
       setPhase("idle");
       setMessage("フォルダを開けませんでした。Chromeのフォルダ権限を確認してください。");
     }
-  }, [beginNewReview, includeSubfolders, sortMode]);
+  }, [beginNewReview, includeSubfolders, phase, sortMode]);
 
   const saveCompletedReview = useCallback(
     async (nextSession: ReviewSessionV1) => {
-      if (!rootHandle) return;
+      if (!rootHandle || saveInFlightRef.current) return;
+      saveInFlightRef.current = true;
       setPhase("saving");
       setSaveError(null);
       try {
@@ -388,6 +391,8 @@ export default function MediaReviewApp() {
       } catch {
         setSaveError("CSVを保存できませんでした。権限を確認して再試行してください。");
         setPhase("complete");
+      } finally {
+        saveInFlightRef.current = false;
       }
     },
     [items, persistSession, rootHandle],
@@ -432,7 +437,15 @@ export default function MediaReviewApp() {
   );
 
   const undo = useCallback(async () => {
-    if (!session || session.history.length === 0 || busyRef.current) return;
+    if (
+      phase === "saving" ||
+      saveInFlightRef.current ||
+      !session ||
+      session.history.length === 0 ||
+      busyRef.current
+    ) {
+      return;
+    }
     busyRef.current = true;
     const history = [...session.history];
     const last = history.pop();
@@ -461,13 +474,19 @@ export default function MediaReviewApp() {
     setPhase("reviewing");
     await persistSession(nextSession);
     busyRef.current = false;
-  }, [persistSession, session]);
+  }, [persistSession, phase, session]);
 
   const saveCsv = useCallback(async () => {
-    if (session && session.history.length === items.length) {
-      await saveCompletedReview(session);
+    if (
+      phase !== "complete" ||
+      saveInFlightRef.current ||
+      !session ||
+      session.history.length !== items.length
+    ) {
+      return;
     }
-  }, [items.length, saveCompletedReview, session]);
+    await saveCompletedReview(session);
+  }, [items.length, phase, saveCompletedReview, session]);
 
   const toggleVideo = useCallback(() => {
     const video = videoRef.current;
@@ -595,7 +614,7 @@ export default function MediaReviewApp() {
 
   if ((phase === "complete" || phase === "saving") && session) {
     return (
-      <main className="center-shell complete-shell">
+      <main className="center-shell complete-shell" aria-busy={phase === "saving"}>
         <div className="complete-mark" aria-hidden="true">✓</div>
         <p className="step-label">仕分け完了</p>
         <h1 className="state-title">{items.length}件を判定しました</h1>
@@ -622,14 +641,33 @@ export default function MediaReviewApp() {
         )}
         <div className="state-actions">
           {!savedFilename && (
-            <button className="primary-action" type="button" onClick={() => void saveCsv()}>
-              {saveError ? "CSV保存を再試行" : "CSVを保存"}
+            <button
+              className="primary-action"
+              type="button"
+              onClick={() => void saveCsv()}
+              disabled={phase === "saving"}
+            >
+              {phase === "saving"
+                ? "CSVを保存中"
+                : saveError
+                  ? "CSV保存を再試行"
+                  : "CSVを保存"}
             </button>
           )}
-          <button className="secondary-action" type="button" onClick={() => void undo()}>
+          <button
+            className="secondary-action"
+            type="button"
+            onClick={() => void undo()}
+            disabled={phase === "saving"}
+          >
             最後の判定に戻る
           </button>
-          <button className="text-action" type="button" onClick={() => void chooseFolder()}>
+          <button
+            className="text-action"
+            type="button"
+            onClick={() => void chooseFolder()}
+            disabled={phase === "saving"}
+          >
             別のフォルダを選ぶ
           </button>
         </div>
