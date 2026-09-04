@@ -21,6 +21,7 @@ const sessionMocks = vi.hoisted(() => ({
 
 const csvMocks = vi.hoisted(() => ({
   createCsvDecisionRows: vi.fn(),
+  getWritableDirectoryHandle: vi.fn(),
   saveDecisionsCsv: vi.fn(),
 }));
 
@@ -109,6 +110,9 @@ beforeEach(() => {
   sessionMocks.saveReviewSession.mockResolvedValue(true);
   sessionMocks.deleteReviewSession.mockResolvedValue(true);
   csvMocks.createCsvDecisionRows.mockReturnValue([{ row: true }]);
+  csvMocks.getWritableDirectoryHandle.mockImplementation(
+    async (handle: FileSystemDirectoryHandle) => handle,
+  );
   csvMocks.saveDecisionsCsv.mockResolvedValue({
     filename: "media-decisions.csv",
     destination: "folder",
@@ -153,6 +157,11 @@ describe("MediaReviewApp", () => {
 
     expect(mediaMocks.scanMediaDirectory).toHaveBeenCalledWith(folder, {
       recursive: false,
+    });
+    expect(window.showDirectoryPicker).toHaveBeenCalledWith({
+      id: "media-review-root",
+      mode: "read",
+      startIn: "pictures",
     });
     expect(screen.getByText("photo.jpg")).toBeInTheDocument();
     expect(document.querySelector(".progress-copy")).toHaveTextContent("1 / 1");
@@ -261,15 +270,69 @@ describe("MediaReviewApp", () => {
     });
   });
 
-  it("最後の判定後にCSVを保存して完了画面を表示する", async () => {
+  it("最後の判定後は明示操作まで待ってからCSVを保存する", async () => {
     const item = mediaItem("only.jpg");
     const folder = await openFolderWith([item]);
+    const user = userEvent.setup();
 
     fireEvent.keyDown(window, { key: "ArrowRight" });
 
-    await waitFor(() => expect(csvMocks.createCsvDecisionRows).toHaveBeenCalledOnce());
-    expect(csvMocks.saveDecisionsCsv).toHaveBeenCalledWith(folder, [{ row: true }]);
     expect(await screen.findByText("1件を判定しました")).toBeInTheDocument();
+    expect(csvMocks.getWritableDirectoryHandle).not.toHaveBeenCalled();
+    expect(csvMocks.saveDecisionsCsv).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "CSVを保存" }));
+
+    await waitFor(() => expect(csvMocks.createCsvDecisionRows).toHaveBeenCalledOnce());
+    expect(csvMocks.getWritableDirectoryHandle).toHaveBeenCalledWith(folder);
+    expect(csvMocks.saveDecisionsCsv).toHaveBeenCalledWith(folder, [{ row: true }]);
     expect(screen.getByText("media-decisions.csv")).toBeInTheDocument();
+  });
+
+  it("書き込みを許可しない場合はダウンロード保存へ切り替える", async () => {
+    csvMocks.getWritableDirectoryHandle.mockResolvedValue(null);
+    csvMocks.saveDecisionsCsv.mockResolvedValue({
+      filename: "media-decisions.csv",
+      destination: "download",
+    });
+    const item = mediaItem("only.jpg");
+    const folder = await openFolderWith([item]);
+    const user = userEvent.setup();
+
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    await user.click(await screen.findByRole("button", { name: "CSVを保存" }));
+
+    await waitFor(() => {
+      expect(csvMocks.getWritableDirectoryHandle).toHaveBeenCalledWith(folder);
+      expect(csvMocks.saveDecisionsCsv).toHaveBeenCalledWith(null, [{ row: true }]);
+    });
+    expect(screen.getByText("のダウンロードを開始しました。")).toBeInTheDocument();
+  });
+
+  it("保存失敗後は再試行と表示し、権限をもう一度確認する", async () => {
+    csvMocks.saveDecisionsCsv
+      .mockRejectedValueOnce(new Error("save failed"))
+      .mockResolvedValueOnce({
+        filename: "media-decisions.csv",
+        destination: "folder",
+      });
+    const item = mediaItem("only.jpg");
+    await openFolderWith([item]);
+    const user = userEvent.setup();
+
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    await user.click(await screen.findByRole("button", { name: "CSVを保存" }));
+    expect(
+      await screen.findByText(
+        "CSVを保存できませんでした。権限を確認して再試行してください。",
+      ),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "CSV保存を再試行" }));
+
+    await waitFor(() =>
+      expect(csvMocks.getWritableDirectoryHandle).toHaveBeenCalledTimes(2),
+    );
+    expect(await screen.findByText("media-decisions.csv")).toBeInTheDocument();
   });
 });

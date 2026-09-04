@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildDecisionsCsv,
   createCsvDecisionRows,
   createCsvFilename,
+  getWritableDirectoryHandle,
   saveDecisionsCsv,
   type CsvDecisionRow,
 } from "../lib/csv";
@@ -20,6 +21,55 @@ const rows: CsvDecisionRow[] = [
     decidedAt: "2026-09-04T01:03:00.000Z",
   },
 ];
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
+describe("directory write permission", () => {
+  it("reuses the handle when readwrite permission is already granted", async () => {
+    const queryPermission = vi.fn(async () => "granted" as PermissionState);
+    const requestPermission = vi.fn(async () => "granted" as PermissionState);
+    const root = {
+      queryPermission,
+      requestPermission,
+    } as unknown as FileSystemDirectoryHandle;
+
+    await expect(getWritableDirectoryHandle(root)).resolves.toBe(root);
+    expect(queryPermission).toHaveBeenCalledWith({ mode: "readwrite" });
+    expect(requestPermission).not.toHaveBeenCalled();
+  });
+
+  it("requests readwrite permission when it is not already granted", async () => {
+    const queryPermission = vi.fn(async () => "prompt" as PermissionState);
+    const requestPermission = vi.fn(async () => "granted" as PermissionState);
+    const root = {
+      queryPermission,
+      requestPermission,
+    } as unknown as FileSystemDirectoryHandle;
+
+    await expect(getWritableDirectoryHandle(root)).resolves.toBe(root);
+    expect(queryPermission).toHaveBeenCalledWith({ mode: "readwrite" });
+    expect(requestPermission).toHaveBeenCalledWith({ mode: "readwrite" });
+  });
+
+  it("returns null when write permission is denied or permission checks fail", async () => {
+    const deniedRoot = {
+      queryPermission: vi.fn(async () => "denied" as PermissionState),
+      requestPermission: vi.fn(async () => "denied" as PermissionState),
+    } as unknown as FileSystemDirectoryHandle;
+    const failingRoot = {
+      queryPermission: vi.fn(async () => {
+        throw new DOMException("blocked", "SecurityError");
+      }),
+      requestPermission: vi.fn(),
+    } as unknown as FileSystemDirectoryHandle;
+
+    await expect(getWritableDirectoryHandle(deniedRoot)).resolves.toBeNull();
+    await expect(getWritableDirectoryHandle(failingRoot)).resolves.toBeNull();
+  });
+});
 
 describe("CSV serialization", () => {
   it("uses a BOM, CRLF, the documented columns, and RFC-style escaping", () => {
@@ -104,5 +154,30 @@ describe("CSV serialization", () => {
     });
     expect(write).toHaveBeenCalledWith(expect.stringMatching(/^\uFEFF/));
     expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("downloads the CSV when no writable directory handle is available", async () => {
+    vi.useFakeTimers();
+    const createObjectURL = vi.fn(() => "blob:csv");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+
+    const result = await saveDecisionsCsv(
+      null,
+      rows,
+      new Date(2026, 8, 4, 14, 5, 6),
+    );
+    await vi.runAllTimersAsync();
+
+    expect(result).toEqual({
+      filename: "media-decisions-20260904-140506.csv",
+      destination: "download",
+    });
+    expect(createObjectURL).toHaveBeenCalledOnce();
+    expect(click).toHaveBeenCalledOnce();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:csv");
   });
 });

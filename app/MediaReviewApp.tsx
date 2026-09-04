@@ -26,7 +26,11 @@ import {
   type ReviewDecision,
   type ReviewSessionV1,
 } from "../lib/session-store";
-import { createCsvDecisionRows, saveDecisionsCsv } from "../lib/csv";
+import {
+  createCsvDecisionRows,
+  getWritableDirectoryHandle,
+  saveDecisionsCsv,
+} from "../lib/csv";
 
 type Phase =
   | "idle"
@@ -307,7 +311,7 @@ export default function MediaReviewApp() {
     try {
       const handle = await window.showDirectoryPicker({
         id: "media-review-root",
-        mode: "readwrite",
+        mode: "read",
         startIn: "pictures",
       });
       setPhase("scanning");
@@ -372,8 +376,9 @@ export default function MediaReviewApp() {
       setPhase("saving");
       setSaveError(null);
       try {
+        const writableRootHandle = await getWritableDirectoryHandle(rootHandle);
         const rows = createCsvDecisionRows(items, nextSession.decisions);
-        const saveResult = await saveDecisionsCsv(rootHandle, rows);
+        const saveResult = await saveDecisionsCsv(writableRootHandle, rows);
         const now = new Date().toISOString();
         const completed = { ...nextSession, updatedAt: now, completedAt: now };
         await persistSession(completed);
@@ -420,10 +425,10 @@ export default function MediaReviewApp() {
       setDragX(0);
       setDragging(false);
 
-      if (nextIndex >= items.length) await saveCompletedReview(nextSession);
+      if (nextIndex >= items.length) setPhase("complete");
       busyRef.current = false;
     },
-    [currentIndex, currentItem, items.length, persistSession, phase, saveCompletedReview, session],
+    [currentIndex, currentItem, items.length, persistSession, phase, session],
   );
 
   const undo = useCallback(async () => {
@@ -458,7 +463,7 @@ export default function MediaReviewApp() {
     busyRef.current = false;
   }, [persistSession, session]);
 
-  const retrySave = useCallback(async () => {
+  const saveCsv = useCallback(async () => {
     if (session && session.history.length === items.length) {
       await saveCompletedReview(session);
     }
@@ -608,13 +613,17 @@ export default function MediaReviewApp() {
               ? "を選択フォルダへ保存しました。"
               : "のダウンロードを開始しました。"}
           </p>
+        ) : saveError ? (
+          <p className="error-message">{saveError}</p>
         ) : (
-          <p className="error-message">{saveError ?? "CSVはまだ保存されていません。"}</p>
+          <p className="state-copy">
+            保存時にフォルダへの書き込み許可を確認します。許可しない場合はダウンロードします。
+          </p>
         )}
         <div className="state-actions">
           {!savedFilename && (
-            <button className="primary-action" type="button" onClick={() => void retrySave()}>
-              CSV保存を再試行
+            <button className="primary-action" type="button" onClick={() => void saveCsv()}>
+              {saveError ? "CSV保存を再試行" : "CSVを保存"}
             </button>
           )}
           <button className="secondary-action" type="button" onClick={() => void undo()}>

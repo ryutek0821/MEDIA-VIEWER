@@ -158,6 +158,25 @@ export function downloadCsv(csv: string, filename: string): boolean {
   return true;
 }
 
+export async function getWritableDirectoryHandle(
+  rootHandle: FileSystemDirectoryHandle,
+): Promise<FileSystemDirectoryHandle | null> {
+  const permission = { mode: "readwrite" } as const;
+
+  try {
+    if (typeof rootHandle.queryPermission !== "function") return null;
+    if ((await rootHandle.queryPermission(permission)) === "granted") {
+      return rootHandle;
+    }
+    if (typeof rootHandle.requestPermission !== "function") return null;
+    return (await rootHandle.requestPermission(permission)) === "granted"
+      ? rootHandle
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function saveDecisionsCsv(
   rootHandle: FileSystemDirectoryHandle | null,
   rows: readonly CsvDecisionRow[],
