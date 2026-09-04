@@ -35,6 +35,39 @@ function session(rootHandle: FileSystemDirectoryHandle): ReviewSessionV1 {
   };
 }
 
+function controlledIndexedDb() {
+  const writeRequest = {
+    result: "session-1",
+    onsuccess: null,
+    onerror: null,
+  } as unknown as IDBRequest<IDBValidKey>;
+  const store = {
+    put: vi.fn(() => writeRequest),
+  } as unknown as IDBObjectStore;
+  const transaction = {
+    objectStore: vi.fn(() => store),
+    oncomplete: null,
+    onabort: null,
+    onerror: null,
+  } as unknown as IDBTransaction;
+  const database = {
+    transaction: vi.fn(() => transaction),
+    close: vi.fn(),
+  } as unknown as IDBDatabase;
+  const openRequest = {
+    result: database,
+    onsuccess: null,
+    onerror: null,
+    onblocked: null,
+    onupgradeneeded: null,
+  } as unknown as IDBOpenDBRequest;
+  const factory = {
+    open: vi.fn(() => openRequest),
+  } as unknown as IDBFactory;
+
+  return { database, factory, openRequest, transaction, writeRequest };
+}
+
 afterEach(() => vi.unstubAllGlobals());
 
 describe("session matching", () => {
@@ -68,6 +101,38 @@ describe("session matching", () => {
 });
 
 describe("IndexedDB availability", () => {
+  it("reports failure when a successful write request is later aborted", async () => {
+    const controlled = controlledIndexedDb();
+    vi.stubGlobal("indexedDB", controlled.factory);
+    const pending = saveReviewSession(
+      session(directoryHandle("写真", async () => true)),
+    );
+
+    controlled.openRequest.onsuccess?.(new Event("success"));
+    await Promise.resolve();
+    controlled.writeRequest.onsuccess?.(new Event("success"));
+    controlled.transaction.onabort?.(new Event("abort"));
+
+    await expect(pending).resolves.toBe(false);
+    expect(controlled.database.close).toHaveBeenCalledOnce();
+  });
+
+  it("reports success only after the write transaction completes", async () => {
+    const controlled = controlledIndexedDb();
+    vi.stubGlobal("indexedDB", controlled.factory);
+    const pending = saveReviewSession(
+      session(directoryHandle("写真", async () => true)),
+    );
+
+    controlled.openRequest.onsuccess?.(new Event("success"));
+    await Promise.resolve();
+    controlled.writeRequest.onsuccess?.(new Event("success"));
+    controlled.transaction.oncomplete?.(new Event("complete"));
+
+    await expect(pending).resolves.toBe(true);
+    expect(controlled.database.close).toHaveBeenCalledOnce();
+  });
+
   it("saves, lists, and deletes metadata without storing media blobs", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
     const root = {

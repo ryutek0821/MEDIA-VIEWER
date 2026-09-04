@@ -74,6 +74,8 @@ async function runRequest<T>(
 
   return new Promise((resolve) => {
     let settled = false;
+    let requestSucceeded = false;
+    let requestResult: T | null = null;
     const finish = (value: T | null) => {
       if (settled) return;
       settled = true;
@@ -84,8 +86,13 @@ async function runRequest<T>(
     try {
       const transaction = database.transaction(SESSION_STORE, mode);
       const request = action(transaction.objectStore(SESSION_STORE));
-      request.onsuccess = () => finish(request.result);
+      request.onsuccess = () => {
+        requestSucceeded = true;
+        requestResult = request.result;
+      };
       request.onerror = () => finish(null);
+      transaction.oncomplete = () =>
+        finish(requestSucceeded ? requestResult : null);
       transaction.onabort = () => finish(null);
       transaction.onerror = () => finish(null);
     } catch {
@@ -170,4 +177,3 @@ export async function findMatchingSession(
 export const saveSession = saveReviewSession;
 export const listSessions = listReviewSessions;
 export const deleteSession = deleteReviewSession;
-
