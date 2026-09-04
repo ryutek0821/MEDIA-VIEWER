@@ -157,6 +157,10 @@ h1 {
 .result-counts { display: flex; gap: clamp(32px, 8vw, 90px); margin-top: 34px; }
 .result-counts span { color: var(--muted); font-size: 14px; }
 .result-counts strong { display: block; color: var(--paper); font-size: clamp(36px, 6vw, 62px); font-variant-numeric: tabular-nums; }
+.scan-error-notice { width: min(calc(100% - 32px), 980px); display: grid; gap: 3px; margin: 12px auto 0; padding: 9px 14px 10px; border-left: 4px solid var(--reject); background: rgb(224 108 87 / 10%); color: #f4c6bd; font-size: 12px; line-height: 1.5; text-align: left; }
+.scan-error-notice strong { color: #ffd2ca; font-size: 13px; }
+.scan-error-paths { color: #d7b0a9; overflow-wrap: anywhere; }
+.complete-shell .scan-error-notice { margin-top: 28px; }
 
 .review-shell { min-height: 100svh; display: flex; flex-direction: column; overflow: hidden; }
 .review-header { min-height: 68px; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 18px; padding: 14px clamp(16px, 3.5vw, 50px); }

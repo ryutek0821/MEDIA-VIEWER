@@ -57,6 +57,32 @@ const sortLabels: Record<SortMode, string> = {
 };
 
 const EMPTY_DECISIONS: Record<string, ReviewDecision> = {};
+const SCAN_ERROR_PATH_LIMIT = 3;
+
+function ScanErrorNotice({
+  errors,
+}: {
+  errors: ScanMediaResult["errors"];
+}) {
+  if (errors.length === 0) return null;
+
+  const paths = [...new Set(errors.map((error) => error.path))];
+  const visiblePaths = paths.slice(0, SCAN_ERROR_PATH_LIMIT);
+  const remainingCount = paths.length - visiblePaths.length;
+  const pathSummary = `${visiblePaths.join("、")}${
+    remainingCount > 0 ? `、ほか${remainingCount}件` : ""
+  }`;
+
+  return (
+    <aside className="scan-error-notice" role="alert" aria-label="走査エラー">
+      <strong>読み取れなかった項目: {errors.length}件</strong>
+      <span>未処理のため、判定結果とCSVには含まれません。</span>
+      <span className="scan-error-paths" title={paths.join("\n")}>
+        対象: {pathSummary}
+      </span>
+    </aside>
+  );
+}
 
 function createSeed(): number {
   const values = new Uint32Array(1);
@@ -572,6 +598,7 @@ export default function MediaReviewApp() {
           <span><strong>{keepCount}</strong> いる</span>
           <span><strong>{rejectCount}</strong> いらない</span>
         </div>
+        <ScanErrorNotice errors={scanSummary?.errors ?? []} />
         {phase === "saving" ? (
           <p className="state-copy">CSVを保存しています…</p>
         ) : savedFilename ? (
@@ -627,6 +654,7 @@ export default function MediaReviewApp() {
         <div className="progress-track" aria-hidden="true">
           <span style={{ width: `${progress}%` }} />
         </div>
+        <ScanErrorNotice errors={scanSummary?.errors ?? []} />
 
         <section className="review-workbench">
           <button className="edge-action reject-edge" type="button" onClick={() => void decide("reject")}>

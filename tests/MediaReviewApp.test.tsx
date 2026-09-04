@@ -44,7 +44,10 @@ function mediaItem(name: string, relativePath = name): MediaItem {
   };
 }
 
-function scanResult(items: MediaItem[]): ScanMediaResult {
+function scanResult(
+  items: MediaItem[],
+  errors: ScanMediaResult["errors"] = [],
+): ScanMediaResult {
   return {
     items,
     ignoredCount: 0,
@@ -57,7 +60,7 @@ function scanResult(items: MediaItem[]): ScanMediaResult {
       unsupportedFiles: 0,
       unsupportedExtensions: {},
     },
-    errors: [],
+    errors,
   };
 }
 
@@ -155,6 +158,37 @@ describe("MediaReviewApp", () => {
     expect(document.querySelector(".progress-copy")).toHaveTextContent("1 / 1");
     expect(screen.getByRole("button", { name: /いる/ })).toBeInTheDocument();
     expect(sessionMocks.saveReviewSession).toHaveBeenCalledOnce();
+  });
+
+  it("一部を読み取れない場合はレビュー中と完了後に対象を通知する", async () => {
+    const item = mediaItem("photo.jpg");
+    const folder = folderHandle();
+    const errors: ScanMediaResult["errors"] = [
+      { path: "locked/a.jpg", operation: "read-file", message: "denied" },
+      { path: "locked/b.jpg", operation: "read-file", message: "denied" },
+      { path: "locked/c.jpg", operation: "read-file", message: "denied" },
+      { path: "locked/d.jpg", operation: "read-file", message: "denied" },
+      { path: "locked/e.jpg", operation: "read-file", message: "denied" },
+    ];
+    installFolderPicker(async () => folder);
+    mediaMocks.scanMediaDirectory.mockResolvedValue(scanResult([item], errors));
+    const user = userEvent.setup();
+    render(<MediaReviewApp />);
+
+    await user.click(screen.getByRole("button", { name: "フォルダを選ぶ" }));
+    await screen.findByText("photo.jpg");
+
+    const reviewNotice = screen.getByRole("alert", { name: "走査エラー" });
+    expect(reviewNotice).toHaveTextContent("読み取れなかった項目: 5件");
+    expect(reviewNotice).toHaveTextContent("locked/a.jpg、locked/b.jpg、locked/c.jpg、ほか2件");
+    expect(reviewNotice).toHaveTextContent("CSVには含まれません");
+
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    await screen.findByText("1件を判定しました");
+
+    const completeNotice = screen.getByRole("alert", { name: "走査エラー" });
+    expect(completeNotice).toHaveTextContent("読み取れなかった項目: 5件");
+    expect(completeNotice).toHaveTextContent("locked/a.jpg、locked/b.jpg、locked/c.jpg、ほか2件");
   });
 
   it("サブフォルダ設定がOFFなら直下のメディアだけを走査対象にする", async () => {
