@@ -43,3 +43,14 @@ test("keeps the finished app free of starter and remote-font dependencies", asyn
     access(new URL("../app/_sites-preview/SkeletonPreview.tsx", import.meta.url)),
   );
 });
+
+test("prioritizes showing the complete review media", async () => {
+  const stylesheet = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  const mediaRule = stylesheet.match(/\.media-card img,\s*\.media-card video\s*\{([^}]+)\}/)?.[1] ?? "";
+
+  assert.match(mediaRule, /width:\s*auto/);
+  assert.match(mediaRule, /height:\s*auto/);
+  assert.match(mediaRule, /max-width:\s*100%/);
+  assert.match(mediaRule, /max-height:\s*100%/);
+  assert.match(mediaRule, /object-fit:\s*contain/);
+});
