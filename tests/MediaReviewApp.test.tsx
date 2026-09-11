@@ -1,390 +1,190 @@
 // @vitest-environment jsdom
 
-import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import MediaReviewApp from "../app/MediaReviewApp";
-import type { MediaItem, ScanMediaResult } from "../lib/media";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import MediaReviewApp from "../app/MediaReviewApp.tsx";
+import type { QueueItem, RatingStats } from "../lib/media.ts";
 
-const mediaMocks = vi.hoisted(() => ({
-  createManifestFingerprint: vi.fn(),
-  scanMediaDirectory: vi.fn(),
-  sortMediaItems: vi.fn(),
+const api = vi.hoisted(() => ({
+  fetchQueue: vi.fn(),
+  putRating: vi.fn(),
+  deleteRating: vi.fn(),
+  mediaUrl: (sha256: string) => `/media/${sha256}`,
 }));
 
-const sessionMocks = vi.hoisted(() => ({
-  deleteReviewSession: vi.fn(),
-  findMatchingSession: vi.fn(),
-  saveReviewSession: vi.fn(),
-}));
+vi.mock("../app/api.ts", () => api);
 
-const csvMocks = vi.hoisted(() => ({
-  createCsvDecisionRows: vi.fn(),
-  getWritableDirectoryHandle: vi.fn(),
-  saveDecisionsCsv: vi.fn(),
-}));
-
-vi.mock("../lib/media", () => mediaMocks);
-vi.mock("../lib/session-store", () => sessionMocks);
-vi.mock("../lib/csv", () => csvMocks);
-
-function mediaItem(name: string, relativePath = name): MediaItem {
+function item(name: string, rating: QueueItem["rating"] = null): QueueItem {
   return {
-    id: relativePath,
-    relativePath,
-    name,
+    sha256: `sha-${name}`,
+    relPath: `batch/${name}.png`,
     kind: "image",
-    sizeBytes: 128,
-    lastModified: 1_700_000_000_000,
-    handle: {
-      kind: "file",
-      name,
-      getFile: vi.fn().mockResolvedValue({ name, size: 128 }),
-    } as unknown as FileSystemFileHandle,
+    sizeBytes: 2048,
+    mtimeMs: 1_757_550_000_000,
+    rating,
+    ratedAt: null,
   };
 }
 
-function scanResult(
-  items: MediaItem[],
-  errors: ScanMediaResult["errors"] = [],
-): ScanMediaResult {
-  return {
-    items,
-    ignoredCount: 0,
-    ignoredExtensions: {},
-    ignored: {
-      hiddenFiles: 0,
-      hiddenDirectories: 0,
-      skippedDirectories: 0,
-      skippedNestedFiles: 0,
-      unsupportedFiles: 0,
-      unsupportedExtensions: {},
-    },
-    errors,
-  };
+const STATS: RatingStats = { total: 2, unrated: 2, reject: 0, keep: 0, hold: 0 };
+
+function queueResponse(items: QueueItem[], stats: RatingStats = STATS) {
+  return { mode: "unrated", items, stats, scanError: null };
 }
-
-function folderHandle(name = "写真"): FileSystemDirectoryHandle {
-  return { kind: "directory", name } as FileSystemDirectoryHandle;
-}
-
-function installFolderPicker(
-  implementation: () => Promise<FileSystemDirectoryHandle>,
-) {
-  const picker = vi.fn(implementation);
-  Object.defineProperty(window, "showDirectoryPicker", {
-    configurable: true,
-    value: picker,
-  });
-  return picker;
-}
-
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, reject, resolve };
-}
-
-async function openFolderWith(items: MediaItem[]) {
-  const folder = folderHandle();
-  installFolderPicker(async () => folder);
-  mediaMocks.scanMediaDirectory.mockResolvedValue(scanResult(items));
-
-  const user = userEvent.setup();
-  render(<MediaReviewApp />);
-  await user.click(screen.getByRole("button", { name: "フォルダを選ぶ" }));
-  await screen.findByText(items[0].name);
-  return folder;
-}
-
-beforeEach(() => {
-  vi.clearAllMocks();
-  delete (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker;
-  Object.defineProperty(URL, "createObjectURL", {
-    configurable: true,
-    value: vi.fn(() => "blob:preview"),
-  });
-  Object.defineProperty(URL, "revokeObjectURL", {
-    configurable: true,
-    value: vi.fn(),
-  });
-
-  mediaMocks.createManifestFingerprint.mockResolvedValue("fingerprint");
-  mediaMocks.sortMediaItems.mockImplementation((items: MediaItem[]) => items);
-  sessionMocks.findMatchingSession.mockResolvedValue(null);
-  sessionMocks.saveReviewSession.mockResolvedValue(true);
-  sessionMocks.deleteReviewSession.mockResolvedValue(true);
-  csvMocks.createCsvDecisionRows.mockReturnValue([{ row: true }]);
-  csvMocks.getWritableDirectoryHandle.mockImplementation(
-    async (handle: FileSystemDirectoryHandle) => handle,
-  );
-  csvMocks.saveDecisionsCsv.mockResolvedValue({
-    filename: "media-decisions.csv",
-    destination: "folder",
-  });
-});
-
-afterEach(() => {
-  cleanup();
-  vi.unstubAllGlobals();
-});
 
 describe("MediaReviewApp", () => {
-  it("案内メッセージを表示し、未対応ブラウザではフォルダ選択を無効にする", async () => {
-    render(<MediaReviewApp />);
-
-    expect(
-      await screen.findByText("この機能はChromeまたはEdgeで開いてください。"),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "フォルダを選ぶ" })).toBeDisabled();
+  beforeEach(() => {
+    api.fetchQueue.mockReset().mockResolvedValue(queueResponse([item("a"), item("b")]));
+    api.putRating.mockReset().mockResolvedValue(undefined);
+    api.deleteRating.mockReset().mockResolvedValue(undefined);
   });
 
-  it("フォルダ選択のキャンセル後も開始画面に留まる", async () => {
-    const picker = installFolderPicker(async () => {
-      throw new DOMException("cancelled", "AbortError");
-    });
+  it("rates with the arrow keys and advances to the next item", async () => {
     const user = userEvent.setup();
     render(<MediaReviewApp />);
 
-    await user.click(screen.getByRole("button", { name: "フォルダを選ぶ" }));
+    expect(await screen.findByRole("img", { name: "batch/a.png" })).toBeInTheDocument();
+    await user.keyboard("{ArrowLeft}");
+    expect(await screen.findByRole("img", { name: "batch/b.png" })).toBeInTheDocument();
+    await user.keyboard("{ArrowDown}");
 
-    await waitFor(() => expect(picker).toHaveBeenCalledOnce());
-    expect(screen.getByText(/残したい一枚を/)).toBeInTheDocument();
-    expect(mediaMocks.scanMediaDirectory).not.toHaveBeenCalled();
-    expect(
-      screen.queryByText("フォルダを開けませんでした。Chromeのフォルダ権限を確認してください。"),
-    ).not.toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "評価待ちはありません" })).toBeInTheDocument();
+    await waitFor(() => expect(api.putRating).toHaveBeenCalledTimes(2));
+    expect(api.putRating).toHaveBeenNthCalledWith(1, "sha-a", "reject");
+    expect(api.putRating).toHaveBeenNthCalledWith(2, "sha-b", "hold");
+    expect(screen.getByText("◯ 0")).toBeInTheDocument();
+    expect(screen.getByText("✕ 1")).toBeInTheDocument();
+    expect(screen.getByText("△ 1")).toBeInTheDocument();
   });
 
-  it("走査したメディアをレビュー画面に表示する", async () => {
-    const item = mediaItem("photo.jpg");
-    const folder = await openFolderWith([item]);
-
-    expect(mediaMocks.scanMediaDirectory).toHaveBeenCalledWith(folder, {
-      recursive: false,
-    });
-    expect(window.showDirectoryPicker).toHaveBeenCalledWith({
-      id: "media-review-root",
-      mode: "read",
-      startIn: "pictures",
-    });
-    expect(screen.getByText("photo.jpg")).toBeInTheDocument();
-    expect(document.querySelector(".progress-copy")).toHaveTextContent("1 / 1");
-    expect(screen.getByRole("button", { name: /いる/ })).toBeInTheDocument();
-    expect(sessionMocks.saveReviewSession).toHaveBeenCalledOnce();
-  });
-
-  it("一部を読み取れない場合はレビュー中と完了後に対象を通知する", async () => {
-    const item = mediaItem("photo.jpg");
-    const folder = folderHandle();
-    const errors: ScanMediaResult["errors"] = [
-      { path: "locked/a.jpg", operation: "read-file", message: "denied" },
-      { path: "locked/b.jpg", operation: "read-file", message: "denied" },
-      { path: "locked/c.jpg", operation: "read-file", message: "denied" },
-      { path: "locked/d.jpg", operation: "read-file", message: "denied" },
-      { path: "locked/e.jpg", operation: "read-file", message: "denied" },
-    ];
-    installFolderPicker(async () => folder);
-    mediaMocks.scanMediaDirectory.mockResolvedValue(scanResult([item], errors));
+  it("rates with the on-screen buttons", async () => {
     const user = userEvent.setup();
     render(<MediaReviewApp />);
 
-    await user.click(screen.getByRole("button", { name: "フォルダを選ぶ" }));
-    await screen.findByText("photo.jpg");
+    await screen.findByRole("img", { name: "batch/a.png" });
+    await user.click(screen.getByRole("button", { name: "マル" }));
+    await screen.findByRole("img", { name: "batch/b.png" });
+    await user.click(screen.getByRole("button", { name: "保留" }));
 
-    const reviewNotice = screen.getByRole("alert", { name: "走査エラー" });
-    expect(reviewNotice).toHaveTextContent("読み取れなかった項目: 5件");
-    expect(reviewNotice).toHaveTextContent("locked/a.jpg、locked/b.jpg、locked/c.jpg、ほか2件");
-    expect(reviewNotice).toHaveTextContent("CSVには含まれません");
-
-    fireEvent.keyDown(window, { key: "ArrowRight" });
-    await screen.findByText("1件を判定しました");
-
-    const completeNotice = screen.getByRole("alert", { name: "走査エラー" });
-    expect(completeNotice).toHaveTextContent("読み取れなかった項目: 5件");
-    expect(completeNotice).toHaveTextContent("locked/a.jpg、locked/b.jpg、locked/c.jpg、ほか2件");
+    await waitFor(() => expect(api.putRating).toHaveBeenCalledWith("sha-b", "hold"));
+    expect(api.putRating).toHaveBeenCalledWith("sha-a", "keep");
   });
 
-  it("サブフォルダ設定がOFFなら直下のメディアだけを走査対象にする", async () => {
-    const folder = folderHandle();
-    const direct = mediaItem("direct.jpg");
-    const nested = mediaItem("nested.jpg", "child/nested.jpg");
-    installFolderPicker(async () => folder);
-    mediaMocks.scanMediaDirectory.mockImplementation(
-      async (_handle: FileSystemDirectoryHandle, options: { recursive?: boolean }) =>
-        scanResult(options.recursive ? [direct, nested] : [direct]),
-    );
+  it("marks an upward swipe as hold", async () => {
+    render(<MediaReviewApp />);
+
+    const card = (await screen.findByRole("img", { name: "batch/a.png" })).parentElement;
+    if (!card) throw new Error("media card missing");
+    fireEvent.pointerDown(card, { pointerId: 1, clientX: 100, clientY: 300 });
+    fireEvent.pointerMove(card, { pointerId: 1, clientX: 104, clientY: 180 });
+    fireEvent.pointerUp(card, { pointerId: 1, clientX: 104, clientY: 180 });
+
+    await waitFor(() => expect(api.putRating).toHaveBeenCalledWith("sha-a", "hold"));
+  });
+
+  it("ignores a tap without movement", async () => {
+    render(<MediaReviewApp />);
+
+    const card = (await screen.findByRole("img", { name: "batch/a.png" })).parentElement;
+    if (!card) throw new Error("media card missing");
+    fireEvent.pointerDown(card, { pointerId: 1, clientX: 100, clientY: 300 });
+    fireEvent.pointerUp(card, { pointerId: 1, clientX: 100, clientY: 300 });
+
+    expect(screen.getByRole("img", { name: "batch/a.png" })).toBeInTheDocument();
+    expect(api.putRating).not.toHaveBeenCalled();
+  });
+
+  it("goes back one item without losing its rating, and re-rating overwrites it", async () => {
     const user = userEvent.setup();
     render(<MediaReviewApp />);
 
-    expect(screen.getByRole("checkbox", { name: "サブフォルダも含める" })).not.toBeChecked();
-    await user.click(screen.getByRole("checkbox", { name: "サブフォルダも含める" }));
-    await user.click(screen.getByRole("checkbox", { name: "サブフォルダも含める" }));
-    await user.click(screen.getByRole("button", { name: "フォルダを選ぶ" }));
-    await screen.findByText("direct.jpg");
+    await screen.findByRole("img", { name: "batch/a.png" });
+    expect(screen.getByRole("button", { name: "戻る" })).toBeDisabled();
+    await user.keyboard("{ArrowRight}");
+    await screen.findByRole("img", { name: "batch/b.png" });
+    await user.keyboard("{ArrowDown}");
+    expect(await screen.findByRole("heading", { name: "評価待ちはありません" })).toBeInTheDocument();
 
-    expect(mediaMocks.scanMediaDirectory).toHaveBeenCalledWith(folder, {
-      recursive: false,
-    });
-    expect(mediaMocks.sortMediaItems.mock.calls[0][0]).toEqual([direct]);
-    expect(document.querySelector(".progress-copy")).toHaveTextContent("1 / 1");
-    expect(screen.getByText("直下のみ")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "↩ 1枚戻る" }));
+    expect(await screen.findByRole("img", { name: "batch/b.png" })).toBeInTheDocument();
+    expect(screen.getByText(/現在の評価: 保留/)).toBeInTheDocument();
+
+    await user.keyboard("{Backspace}");
+    expect(await screen.findByRole("img", { name: "batch/a.png" })).toBeInTheDocument();
+    expect(screen.getByText(/現在の評価: マル/)).toBeInTheDocument();
+    expect(screen.getByText("◯ 1")).toBeInTheDocument();
+
+    await user.keyboard("{ArrowLeft}");
+    await waitFor(() => expect(api.putRating).toHaveBeenCalledTimes(3));
+    expect(api.putRating).toHaveBeenLastCalledWith("sha-a", "reject");
+    expect(api.deleteRating).not.toHaveBeenCalled();
+    expect(screen.getByText("◯ 0")).toBeInTheDocument();
+    expect(screen.getByText("✕ 1")).toBeInTheDocument();
+    expect(await screen.findByRole("img", { name: "batch/b.png" })).toBeInTheDocument();
   });
 
-  it("サブフォルダ設定がONなら入れ子のメディアも走査対象にする", async () => {
-    const folder = folderHandle();
-    const direct = mediaItem("direct.jpg");
-    const nested = mediaItem("nested.jpg", "child/nested.jpg");
-    installFolderPicker(async () => folder);
-    mediaMocks.scanMediaDirectory.mockImplementation(
-      async (_handle: FileSystemDirectoryHandle, options: { recursive?: boolean }) =>
-        scanResult(options.recursive ? [direct, nested] : [direct]),
-    );
+  it("reloads the queue and explains when a rating cannot be saved", async () => {
+    api.putRating.mockRejectedValueOnce(new Error("offline"));
     const user = userEvent.setup();
     render(<MediaReviewApp />);
 
-    await user.click(screen.getByRole("checkbox", { name: "サブフォルダも含める" }));
-    await user.click(screen.getByRole("button", { name: "フォルダを選ぶ" }));
-    await screen.findByText("direct.jpg");
+    await screen.findByRole("img", { name: "batch/a.png" });
+    await user.keyboard("{ArrowRight}");
 
-    expect(mediaMocks.scanMediaDirectory).toHaveBeenCalledWith(folder, {
-      recursive: true,
-    });
-    expect(mediaMocks.sortMediaItems.mock.calls[0][0]).toEqual([direct, nested]);
-    expect(document.querySelector(".progress-copy")).toHaveTextContent("1 / 2");
+    expect(await screen.findByText(/評価を保存できませんでした（offline）/)).toBeInTheDocument();
+    await waitFor(() => expect(api.fetchQueue).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("img", { name: "batch/a.png" })).toBeInTheDocument();
   });
 
-  it("右キーをいる、左キーをいらないとして記録する", async () => {
-    const first = mediaItem("first.jpg");
-    const second = mediaItem("second.jpg");
-    const third = mediaItem("third.jpg");
-    await openFolderWith([first, second, third]);
-
-    fireEvent.keyDown(window, { key: "ArrowRight" });
-    await screen.findByText("second.jpg");
-    await waitFor(() => {
-      const saved = sessionMocks.saveReviewSession.mock.calls.at(-1)?.[0];
-      expect(saved.decisions["first.jpg"].decision).toBe("keep");
-    });
-
-    fireEvent.keyDown(window, { key: "ArrowLeft" });
-    await screen.findByText("third.jpg");
-    await waitFor(() => {
-      const saved = sessionMocks.saveReviewSession.mock.calls.at(-1)?.[0];
-      expect(saved.decisions["second.jpg"].decision).toBe("reject");
-    });
-  });
-
-  it("保存中は多重実行と画面移動を防ぎ、完了後に操作を戻す", async () => {
-    const pendingSave = deferred<{
-      filename: string;
-      destination: "folder" | "download";
-    }>();
-    csvMocks.saveDecisionsCsv.mockReturnValue(pendingSave.promise);
-    const item = mediaItem("only.jpg");
-    const folder = await openFolderWith([item]);
-
-    fireEvent.keyDown(window, { key: "ArrowRight" });
-
-    expect(await screen.findByText("1件を判定しました")).toBeInTheDocument();
-    expect(csvMocks.getWritableDirectoryHandle).not.toHaveBeenCalled();
-    expect(csvMocks.saveDecisionsCsv).not.toHaveBeenCalled();
-
-    const saveButton = screen.getByRole("button", { name: "CSVを保存" });
-    const undoButton = screen.getByRole("button", { name: "最後の判定に戻る" });
-    const folderButton = screen.getByRole("button", { name: "別のフォルダを選ぶ" });
-    act(() => {
-      saveButton.click();
-      saveButton.click();
-      undoButton.click();
-      folderButton.click();
-    });
-
-    await waitFor(() => expect(csvMocks.saveDecisionsCsv).toHaveBeenCalledOnce());
-    expect(csvMocks.createCsvDecisionRows).toHaveBeenCalledOnce();
-    expect(csvMocks.getWritableDirectoryHandle).toHaveBeenCalledWith(folder);
-    expect(csvMocks.saveDecisionsCsv).toHaveBeenCalledWith(folder, [{ row: true }]);
-    expect(window.showDirectoryPicker).toHaveBeenCalledOnce();
-    expect(screen.getByRole("button", { name: "CSVを保存中" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "最後の判定に戻る" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "別のフォルダを選ぶ" })).toBeDisabled();
-
-    await act(async () => {
-      pendingSave.resolve({
-        filename: "media-decisions.csv",
-        destination: "folder",
-      });
-      await Promise.resolve();
-    });
-
-    expect(await screen.findByText("media-decisions.csv")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "最後の判定に戻る" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "別のフォルダを選ぶ" })).toBeEnabled();
-  });
-
-  it("書き込みを許可しない場合はダウンロード保存へ切り替える", async () => {
-    csvMocks.getWritableDirectoryHandle.mockResolvedValue(null);
-    csvMocks.saveDecisionsCsv.mockResolvedValue({
-      filename: "media-decisions.csv",
-      destination: "download",
-    });
-    const item = mediaItem("only.jpg");
-    const folder = await openFolderWith([item]);
+  it("loads the hold queue when the mode changes", async () => {
     const user = userEvent.setup();
+    render(<MediaReviewApp />);
 
-    fireEvent.keyDown(window, { key: "ArrowRight" });
-    await user.click(await screen.findByRole("button", { name: "CSVを保存" }));
+    await screen.findByRole("img", { name: "batch/a.png" });
+    api.fetchQueue.mockResolvedValue(queueResponse([]));
+    await user.selectOptions(screen.getByRole("combobox", { name: "表示する対象" }), "hold");
 
-    await waitFor(() => {
-      expect(csvMocks.getWritableDirectoryHandle).toHaveBeenCalledWith(folder);
-      expect(csvMocks.saveDecisionsCsv).toHaveBeenCalledWith(null, [{ row: true }]);
-    });
-    expect(screen.getByText("のダウンロードを開始しました。")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "保留はありません" })).toBeInTheDocument();
+    expect(api.fetchQueue).toHaveBeenLastCalledWith("hold");
   });
 
-  it("保存失敗後は再試行と表示し、権限をもう一度確認する", async () => {
-    const pendingSave = deferred<{
-      filename: string;
-      destination: "folder" | "download";
-    }>();
-    csvMocks.saveDecisionsCsv
-      .mockReturnValueOnce(pendingSave.promise)
-      .mockResolvedValueOnce({
-        filename: "media-decisions.csv",
-        destination: "folder",
-      });
-    const item = mediaItem("only.jpg");
-    await openFolderWith([item]);
+  it("offers a retry when the queue cannot be loaded", async () => {
+    api.fetchQueue.mockRejectedValueOnce(new Error("サーバーでエラーが発生しました"));
     const user = userEvent.setup();
+    render(<MediaReviewApp />);
 
-    fireEvent.keyDown(window, { key: "ArrowRight" });
-    await user.click(await screen.findByRole("button", { name: "CSVを保存" }));
-    expect(screen.getByRole("button", { name: "CSVを保存中" })).toBeDisabled();
+    expect(await screen.findByText("サーバーでエラーが発生しました")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "もう一度読み込む" }));
+    expect(await screen.findByRole("img", { name: "batch/a.png" })).toBeInTheDocument();
+  });
 
-    await act(async () => {
-      pendingSave.reject(new Error("save failed"));
-      await Promise.resolve();
-    });
+  it("ignores rating keys and undo while another queue is loading", async () => {
+    const user = userEvent.setup();
+    render(<MediaReviewApp />);
 
-    expect(
-      await screen.findByText(
-        "CSVを保存できませんでした。権限を確認して再試行してください。",
-      ),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "CSV保存を再試行" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "最後の判定に戻る" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "別のフォルダを選ぶ" })).toBeEnabled();
+    await screen.findByRole("img", { name: "batch/a.png" });
+    await user.keyboard("{ArrowRight}");
+    await waitFor(() => expect(api.putRating).toHaveBeenCalledTimes(1));
 
-    await user.click(screen.getByRole("button", { name: "CSV保存を再試行" }));
+    api.fetchQueue.mockReturnValue(new Promise(() => {}));
+    await user.selectOptions(screen.getByRole("combobox", { name: "表示する対象" }), "hold");
+    expect(await screen.findByText("読み込んでいます…")).toBeInTheDocument();
+    (document.activeElement as HTMLElement | null)?.blur();
+    await user.keyboard("{Backspace}{ArrowRight}");
 
-    await waitFor(() =>
-      expect(csvMocks.getWritableDirectoryHandle).toHaveBeenCalledTimes(2),
-    );
-    expect(await screen.findByText("media-decisions.csv")).toBeInTheDocument();
+    expect(api.deleteRating).not.toHaveBeenCalled();
+    expect(api.putRating).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not leave focus on a rating button after a pointer click", async () => {
+    const user = userEvent.setup();
+    render(<MediaReviewApp />);
+
+    await screen.findByRole("img", { name: "batch/a.png" });
+    await user.click(screen.getByRole("button", { name: "マル" }));
+
+    await screen.findByRole("img", { name: "batch/b.png" });
+    expect(screen.getByRole("button", { name: "マル" })).not.toHaveFocus();
   });
 });
