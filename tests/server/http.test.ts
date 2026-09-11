@@ -1,7 +1,7 @@
 // @vitest-environment node
 
 import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
-import { createServer, type Server } from "node:http";
+import { createServer, request, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -203,5 +203,26 @@ describe("HTTP API", () => {
 
     expect((await fetch(`${base}/assets/missing.js`)).status).toBe(404);
     expect((await fetch(`${base}/api/unknown`)).status).toBe(404);
+  });
+
+  it("refuses requests addressed to another host name (DNS rebinding)", async () => {
+    const { port } = server.address() as AddressInfo;
+    const status = await new Promise<number>((resolve, reject) => {
+      const outgoing = request(
+        {
+          host: "127.0.0.1",
+          port,
+          path: "/api/export.csv",
+          headers: { Host: `attacker.example:${port}` },
+        },
+        (response) => {
+          response.resume();
+          resolve(response.statusCode ?? 0);
+        },
+      );
+      outgoing.on("error", reject);
+      outgoing.end();
+    });
+    expect(status).toBe(421);
   });
 });

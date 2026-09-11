@@ -184,12 +184,24 @@ export class RatingStore {
     });
   }
 
-  markMissingExcept(presentPaths: readonly string[]): void {
-    this.#db
-      .prepare(
-        "UPDATE media SET missing = 1 WHERE missing = 0 AND rel_path NOT IN (SELECT value FROM json_each(?))",
-      )
-      .run(JSON.stringify(presentPaths));
+  /**
+   * Flags paths absent from the latest scan as missing and restores unchanged files
+   * that reappeared. Rows whose state is already correct are left untouched.
+   */
+  markPresence(presentPaths: readonly string[], seenAt: string): void {
+    const paths = JSON.stringify(presentPaths);
+    this.#transaction(() => {
+      this.#db
+        .prepare(
+          "UPDATE media SET missing = 1 WHERE missing = 0 AND rel_path NOT IN (SELECT value FROM json_each(?))",
+        )
+        .run(paths);
+      this.#db
+        .prepare(
+          "UPDATE media SET missing = 0, last_seen_at = ? WHERE missing = 1 AND rel_path IN (SELECT value FROM json_each(?))",
+        )
+        .run(seenAt, paths);
+    });
   }
 
   queue(mode: QueueMode): QueueItem[] {

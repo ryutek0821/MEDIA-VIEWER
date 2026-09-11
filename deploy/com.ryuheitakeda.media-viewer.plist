@@ -23,6 +23,8 @@
     <string>8792</string>
     <key>MEDIA_ROOT</key>
     <string>/Users/ryuheitakeda/ClaudeCode/PROJECT-MARIN/output</string>
+    <key>ALLOWED_HOSTS</key>
+    <string>localhost,127.0.0.1,ryu-macbookpro.tail93b3c7.ts.net</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

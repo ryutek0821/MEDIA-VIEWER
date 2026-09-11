@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_ALLOWED_HOSTS } from "./http.ts";
 
 export interface ServerConfig {
   host: string;
@@ -8,6 +9,7 @@ export interface ServerConfig {
   mediaRoot: string;
   dataDir: string;
   distDir: string;
+  allowedHosts: string[];
 }
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -28,6 +30,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       env.DATA_DIR ?? path.join(home, "Library", "Application Support", "Media Viewer"),
     ),
     distDir: path.resolve(env.DIST_DIR ?? path.join(REPO_ROOT, "dist")),
+    allowedHosts: env.ALLOWED_HOSTS
+      ? env.ALLOWED_HOSTS.split(",")
+          .map((name) => name.trim().toLowerCase())
+          .filter(Boolean)
+      : [...DEFAULT_ALLOWED_HOSTS],
   };
 }
 

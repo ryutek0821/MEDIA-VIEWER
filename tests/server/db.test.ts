@@ -36,7 +36,10 @@ describe("RatingStore", () => {
 
   function scan(records: MediaRecord[]) {
     store.upsertMedia(records, AT);
-    store.markMissingExcept(records.map((item) => item.relPath));
+    store.markPresence(
+      records.map((item) => item.relPath),
+      AT,
+    );
   }
 
   it("queues one entry per content hash, oldest first", () => {

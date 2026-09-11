@@ -148,4 +148,33 @@ describe("MediaReviewApp", () => {
     await user.click(screen.getByRole("button", { name: "もう一度読み込む" }));
     expect(await screen.findByRole("img", { name: "batch/a.png" })).toBeInTheDocument();
   });
+
+  it("ignores rating keys and undo while another queue is loading", async () => {
+    const user = userEvent.setup();
+    render(<MediaReviewApp />);
+
+    await screen.findByRole("img", { name: "batch/a.png" });
+    await user.keyboard("{ArrowRight}");
+    await waitFor(() => expect(api.putRating).toHaveBeenCalledTimes(1));
+
+    api.fetchQueue.mockReturnValue(new Promise(() => {}));
+    await user.selectOptions(screen.getByRole("combobox", { name: "表示する対象" }), "hold");
+    expect(await screen.findByText("読み込んでいます…")).toBeInTheDocument();
+    (document.activeElement as HTMLElement | null)?.blur();
+    await user.keyboard("{Backspace}{ArrowRight}");
+
+    expect(api.deleteRating).not.toHaveBeenCalled();
+    expect(api.putRating).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not leave focus on a rating button after a pointer click", async () => {
+    const user = userEvent.setup();
+    render(<MediaReviewApp />);
+
+    await screen.findByRole("img", { name: "batch/a.png" });
+    await user.click(screen.getByRole("button", { name: "マル" }));
+
+    await screen.findByRole("img", { name: "batch/b.png" });
+    expect(screen.getByRole("button", { name: "マル" })).not.toHaveFocus();
+  });
 });

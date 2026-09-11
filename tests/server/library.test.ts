@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, rename, rm, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { RatingStore } from "../../server/db.ts";
@@ -21,8 +21,8 @@ describe("MediaLibrary", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  function createLibrary() {
-    return new MediaLibrary({ mediaRoot: root, store, settleMs: 0, log: () => {} });
+  function createLibrary(options: { settleMs?: number; now?: () => number } = {}) {
+    return new MediaLibrary({ mediaRoot: root, store, settleMs: 0, log: () => {}, ...options });
   }
 
   it("hashes only new or changed paths and keeps ratings across moves", async () => {
@@ -42,6 +42,46 @@ describe("MediaLibrary", () => {
     expect(store.queue("all").map((entry) => [entry.relPath, entry.rating])).toEqual([
       ["moved/a.png", "keep"],
     ]);
+  });
+
+  it("waits for new files to settle but keeps known files visible while they change", async () => {
+    let now = Date.parse("2026-09-11T00:10:00Z");
+    const library = createLibrary({ settleMs: 60_000, now: () => now });
+    const file = path.join(root, "a.mp4");
+    const writeRecently = async (content: string) => {
+      await writeFile(file, content);
+      const modified = new Date(now - 1_000);
+      await utimes(file, modified, modified);
+    };
+
+    await writeRecently("first");
+    expect(await library.sync()).toEqual({ files: 0, hashed: 0, failed: 0 });
+
+    now += 120_000;
+    expect(await library.sync()).toEqual({ files: 1, hashed: 1, failed: 0 });
+    const [original] = store.queue("all");
+
+    await writeRecently("second version");
+    expect(await library.sync()).toEqual({ files: 1, hashed: 0, failed: 0 });
+    expect(store.findPresentFile(original.sha256)).toEqual({ relPath: "a.mp4", kind: "video" });
+
+    now += 120_000;
+    expect(await library.sync()).toEqual({ files: 1, hashed: 1, failed: 0 });
+    expect(store.findPresentFile(original.sha256)).toBeNull();
+  });
+
+  it("restores a file that disappears and comes back unchanged", async () => {
+    await writeFile(path.join(root, "a.mp4"), "video");
+    const library = createLibrary();
+    await library.sync();
+
+    await rename(path.join(root, "a.mp4"), path.join(root, ".a.mp4"));
+    await library.sync();
+    expect(store.stats().total).toBe(0);
+
+    await rename(path.join(root, ".a.mp4"), path.join(root, "a.mp4"));
+    expect(await library.sync()).toEqual({ files: 1, hashed: 0, failed: 0 });
+    expect(store.stats().total).toBe(1);
   });
 
   it("keeps the catalogue and reports an error when the folder cannot be read", async () => {

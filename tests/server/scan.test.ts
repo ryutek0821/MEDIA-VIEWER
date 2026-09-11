@@ -17,28 +17,23 @@ describe("scanMediaRoot", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it("lists settled media and skips hidden, symlinked, unsupported and fresh files", async () => {
-    const settled = new Date("2026-09-11T00:00:00Z");
-    const now = settled.getTime() + 120_000;
+  it("lists media and skips hidden, symlinked and unsupported files", async () => {
     await mkdir(path.join(root, "batch"));
     await mkdir(path.join(root, ".cache"));
-    const files = ["batch/b.png", "a.mp4", "notes.json", ".hidden.png", ".cache/c.png"];
-    for (const file of files) {
+    for (const file of ["batch/b.png", "a.mp4", "notes.json", ".hidden.png", ".cache/c.png"]) {
       await writeFile(path.join(root, file), "data");
-      await utimes(path.join(root, file), settled, settled);
     }
-    await writeFile(path.join(root, "copying.png"), "partial");
-    const recent = new Date(now - 1_000);
-    await utimes(path.join(root, "copying.png"), recent, recent);
+    const modified = new Date("2026-09-11T00:00:00Z");
+    await utimes(path.join(root, "a.mp4"), modified, modified);
     await symlink(path.join(root, "a.mp4"), path.join(root, "link.mp4"));
 
-    const scanned = await scanMediaRoot(root, { now });
+    const scanned = await scanMediaRoot(root);
 
     expect(scanned.map((file) => [file.relPath, file.kind, file.sizeBytes])).toEqual([
       ["a.mp4", "video", 4],
       ["batch/b.png", "image", 4],
     ]);
-    expect(scanned[0].mtimeMs).toBe(settled.getTime());
+    expect(scanned[0].mtimeMs).toBe(modified.getTime());
   });
 
   it("fails instead of returning a partial list when the root is missing", async () => {

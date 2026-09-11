@@ -4,9 +4,6 @@ import { lstat, readdir } from "node:fs/promises";
 import path from "node:path";
 import { getMediaKind, type MediaKind } from "../lib/media.ts";
 
-/** Files modified more recently than this are probably still being copied in. */
-export const DEFAULT_SETTLE_MS = 60_000;
-
 export interface ScannedFile {
   relPath: string;
   absPath: string;
@@ -15,21 +12,11 @@ export interface ScannedFile {
   mtimeMs: number;
 }
 
-export interface ScanOptions {
-  now?: number;
-  settleMs?: number;
-}
-
 /**
  * Lists supported media below `root`. Any read error aborts the whole scan so a
  * transient failure never makes existing files look deleted.
  */
-export async function scanMediaRoot(
-  root: string,
-  options: ScanOptions = {},
-): Promise<ScannedFile[]> {
-  const now = options.now ?? Date.now();
-  const settleMs = options.settleMs ?? DEFAULT_SETTLE_MS;
+export async function scanMediaRoot(root: string): Promise<ScannedFile[]> {
   const files: ScannedFile[] = [];
 
   async function walk(directory: string, relDirectory: string): Promise<void> {
@@ -46,8 +33,7 @@ export async function scanMediaRoot(
       const kind = entry.isFile() ? getMediaKind(entry.name) : null;
       if (!kind) continue;
       const stats = await lstat(absPath);
-      // mtime has sub-millisecond precision and can be slightly ahead of `now`.
-      if (!stats.isFile() || (settleMs > 0 && now - stats.mtimeMs < settleMs)) continue;
+      if (!stats.isFile()) continue;
       files.push({
         relPath,
         absPath,

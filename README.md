@@ -87,6 +87,7 @@ tailscale serve --https=8445 off
 | `MEDIA_ROOT` | `~/ClaudeCode/PROJECT-MARIN/output` |
 | `DATA_DIR` | `~/Library/Application Support/Media Viewer` |
 | `HOST` / `PORT` | `127.0.0.1` / `8792` |
+| `ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]`（launchd 設定では Tailnet のホスト名を追加。これ以外の Host ヘッダーは DNS リバインディング対策で拒否） |
 | `DIST_DIR` | リポジトリの `dist` |
 
 ## 開発

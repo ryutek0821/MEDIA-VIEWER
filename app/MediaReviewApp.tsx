@@ -187,6 +187,9 @@ export default function MediaReviewApp() {
       } catch (error) {
         if (generation !== generationRef.current) return;
         if (reset) {
+          // Nothing stale may stay rateable (by key or undo) behind the error screen.
+          commitPending([]);
+          commitHistory([]);
           setLoadError(errorMessage(error));
           setStatus("error");
         } else {
@@ -337,6 +340,11 @@ export default function MediaReviewApp() {
   };
 
   const onModeChange = (event: ChangeEvent<HTMLSelectElement>) => {
+    // Drop the previous mode's queue at once (and ignore refreshes still in flight),
+    // so keys or undo cannot act on items that are no longer on screen.
+    generationRef.current += 1;
+    commitPending([]);
+    commitHistory([]);
     setStatus("loading");
     setMode(event.target.value as QueueMode);
   };
@@ -497,7 +505,12 @@ export default function MediaReviewApp() {
                 type="button"
                 className={`rating-button ${rating}`}
                 aria-keyshortcuts={RATING_KEYS[rating]}
-                onClick={() => decide(rating)}
+                onClick={(event) => {
+                  // After a mouse/touch click, a focused button would turn a later
+                  // Space (meant to pause a video) into another rating.
+                  if (event.detail > 0) event.currentTarget.blur();
+                  decide(rating);
+                }}
               >
                 <span aria-hidden="true">{RATING_SYMBOLS[rating]}</span>
                 {RATING_LABELS[rating]}

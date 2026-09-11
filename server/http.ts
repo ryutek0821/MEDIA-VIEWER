@@ -38,7 +38,24 @@ export interface AppOptions {
   mediaRoot: string;
   distDir: string | null;
   queueSyncMaxAgeMs?: number;
+  /** Host names this server answers to; anything else is refused. */
+  allowedHosts?: readonly string[];
   log?: (message: string) => void;
+}
+
+export const DEFAULT_ALLOWED_HOSTS: readonly string[] = ["localhost", "127.0.0.1", "[::1]"];
+
+/**
+ * Guards against DNS rebinding: a hostile page whose domain resolves to 127.0.0.1
+ * still sends its own name in Host, so it cannot read or change ratings.
+ */
+function isAllowedHost(hostHeader: string | undefined, allowedHosts: readonly string[]): boolean {
+  if (!hostHeader) return false;
+  try {
+    return allowedHosts.includes(new URL(`http://${hostHeader}`).hostname.toLowerCase());
+  } catch {
+    return false;
+  }
 }
 
 export interface ByteRange {
@@ -337,6 +354,10 @@ export function createRequestHandler(options: AppOptions) {
   }
 
   return async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!isAllowedHost(req.headers.host, options.allowedHosts ?? DEFAULT_ALLOWED_HOSTS)) {
+      sendJson(res, 421, { error: "このホスト名ではアクセスできません" });
+      return;
+    }
     try {
       await route(req, res);
     } catch (error) {

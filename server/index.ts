@@ -20,6 +20,7 @@ const server = createServer(
     library,
     mediaRoot: config.mediaRoot,
     distDir: config.distDir,
+    allowedHosts: config.allowedHosts,
     log,
   }),
 );
