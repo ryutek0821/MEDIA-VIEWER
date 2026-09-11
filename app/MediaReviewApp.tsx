@@ -1,862 +1,540 @@
-/* eslint-disable @next/next/no-img-element -- local blob URLs cannot use next/image */
-"use client";
-
 import {
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import {
-  createManifestFingerprint,
-  scanMediaDirectory,
-  sortMediaItems,
-  type Decision,
-  type MediaItem,
-  type ScanMediaResult,
-  type SortMode,
-} from "../lib/media";
-import {
-  deleteReviewSession,
-  findMatchingSession,
-  saveReviewSession,
-  type ReviewDecision,
-  type ReviewSessionV1,
-} from "../lib/session-store";
-import {
-  createCsvDecisionRows,
-  getWritableDirectoryHandle,
-  saveDecisionsCsv,
-} from "../lib/csv";
+import type { QueueItem, QueueMode, Rating, RatingStats } from "../lib/media.ts";
+import { deleteRating, fetchQueue, mediaUrl, putRating } from "./api.ts";
 
-type Phase =
-  | "idle"
-  | "scanning"
-  | "resume"
-  | "reviewing"
-  | "saving"
-  | "complete";
+const REFRESH_INTERVAL_MS = 30_000;
+const HISTORY_LIMIT = 200;
+const PRELOAD_COUNT = 2;
+const MIN_SWIPE_PX = 48;
 
-interface PendingFolder {
-  rootHandle: FileSystemDirectoryHandle;
-  scan: ScanMediaResult;
-  fingerprint: string;
-  includeSubfolders: boolean;
-  sortMode: SortMode;
+const MODE_OPTIONS: ReadonlyArray<{ value: QueueMode; label: string }> = [
+  { value: "unrated", label: "未評価" },
+  { value: "hold", label: "保留を見直す" },
+  { value: "all", label: "すべて" },
+];
+
+const RATING_LABELS: Readonly<Record<Rating, string>> = {
+  reject: "バツ",
+  keep: "マル",
+  hold: "保留",
+};
+
+const RATING_SYMBOLS: Readonly<Record<Rating, string>> = {
+  reject: "✕",
+  keep: "◯",
+  hold: "△",
+};
+
+const RATING_KEYS: Readonly<Record<Rating, string>> = {
+  reject: "ArrowLeft",
+  hold: "ArrowDown",
+  keep: "ArrowRight",
+};
+
+const BUTTON_ORDER: readonly Rating[] = ["reject", "hold", "keep"];
+const KEY_TO_RATING = new Map(BUTTON_ORDER.map((rating) => [RATING_KEYS[rating], rating]));
+
+type DragStyle = CSSProperties & Record<"--drag-x" | "--drag-y" | "--drag-rotation", string>;
+type LoadStatus = "loading" | "ready" | "error";
+
+interface DragOffset {
+  x: number;
+  y: number;
 }
 
-type DragStyle = CSSProperties & {
-  "--drag-x": string;
-  "--drag-rotation": string;
-};
+interface HistoryEntry {
+  item: QueueItem;
+  previous: Rating | null;
+  next: Rating;
+}
 
-const sortLabels: Record<SortMode, string> = {
-  name: "ファイル名順",
-  oldest: "古い順",
-  newest: "新しい順",
-  random: "ランダム",
-};
+const NO_DRAG: DragOffset = { x: 0, y: 0 };
 
-const EMPTY_DECISIONS: Record<string, ReviewDecision> = {};
-const SCAN_ERROR_PATH_LIMIT = 3;
+const modifiedFormatter = new Intl.DateTimeFormat("ja-JP", {
+  dateStyle: "short",
+  timeStyle: "short",
+});
 
-function ScanErrorNotice({
-  errors,
-}: {
-  errors: ScanMediaResult["errors"];
-}) {
-  if (errors.length === 0) return null;
-
-  const paths = [...new Set(errors.map((error) => error.path))];
-  const visiblePaths = paths.slice(0, SCAN_ERROR_PATH_LIMIT);
-  const remainingCount = paths.length - visiblePaths.length;
-  const pathSummary = `${visiblePaths.join("、")}${
-    remainingCount > 0 ? `、ほか${remainingCount}件` : ""
-  }`;
-
+function isTextEntryTarget(target: EventTarget | null): boolean {
   return (
-    <aside className="scan-error-notice" role="alert" aria-label="走査エラー">
-      <strong>読み取れなかった項目: {errors.length}件</strong>
-      <span>未処理のため、判定結果とCSVには含まれません。</span>
-      <span className="scan-error-paths" title={paths.join("\n")}>
-        対象: {pathSummary}
-      </span>
-    </aside>
+    target instanceof Element &&
+    target.closest("input, select, textarea, [contenteditable='true']") !== null
   );
 }
 
-function createSeed(): number {
-  const values = new Uint32Array(1);
-  crypto.getRandomValues(values);
-  return values[0];
+function isControlTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element && target.closest("a, button, input, select, textarea") !== null
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function adjustStats(
+  stats: RatingStats | null,
+  from: Rating | null,
+  to: Rating | null,
+): RatingStats | null {
+  if (!stats || from === to) return stats;
+  const next = { ...stats };
+  if (from === null) next.unrated -= 1;
+  else next[from] -= 1;
+  if (to === null) next.unrated += 1;
+  else next[to] += 1;
+  return next;
+}
+
+function dragDirection({ x, y }: DragOffset): Rating | null {
+  if (Math.abs(x) >= Math.abs(y)) {
+    if (x === 0) return null;
+    return x > 0 ? "keep" : "reject";
+  }
+  return y < 0 ? "hold" : null;
+}
+
+/** Horizontal swipes choose バツ / マル; an upward swipe chooses 保留. */
+function ratingFromDrag(offset: DragOffset, width: number, height: number): Rating | null {
+  const direction = dragDirection(offset);
+  if (direction === "hold") {
+    return -offset.y >= Math.max(height * 0.18, MIN_SWIPE_PX) ? "hold" : null;
+  }
+  if (direction) {
+    return Math.abs(offset.x) >= Math.max(width * 0.25, MIN_SWIPE_PX) ? direction : null;
+  }
+  return null;
 }
 
 function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
-  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
-}
-
-function makeSession(
-  rootHandle: FileSystemDirectoryHandle,
-  fingerprint: string,
-  includeSubfolders: boolean,
-  selectedSort: SortMode,
-  seed: number,
-  orderedItems: readonly MediaItem[],
-): ReviewSessionV1 {
-  const now = new Date().toISOString();
-  return {
-    schemaVersion: 1,
-    id: `${fingerprint}-${Date.now()}`,
-    rootName: rootHandle.name,
-    rootHandle,
-    manifestFingerprint: fingerprint,
-    includeSubfolders,
-    sortMode: selectedSort,
-    randomSeed: seed,
-    orderedPaths: orderedItems.map((item) => item.relativePath),
-    decisions: {},
-    history: [],
-    createdAt: now,
-    updatedAt: now,
-    completedAt: null,
-  };
-}
-
-function isInteractiveTarget(target: EventTarget | null): boolean {
-  return (
-    target instanceof HTMLElement &&
-    Boolean(target.closest("button, input, select, textarea, a, [contenteditable='true']"))
-  );
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 export default function MediaReviewApp() {
-  const [phase, setPhase] = useState<Phase>("idle");
-  const [includeSubfolders, setIncludeSubfolders] = useState(false);
-  const [sortMode, setSortMode] = useState<SortMode>("name");
-  const [supported, setSupported] = useState<boolean | null>(null);
-  const [rootHandle, setRootHandle] = useState<FileSystemDirectoryHandle | null>(null);
-  const [items, setItems] = useState<MediaItem[]>([]);
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const [session, setSession] = useState<ReviewSessionV1 | null>(null);
-  const [pendingFolder, setPendingFolder] = useState<PendingFolder | null>(null);
-  const [resumeCandidate, setResumeCandidate] = useState<ReviewSessionV1 | null>(null);
-  const [scanSummary, setScanSummary] = useState<ScanMediaResult | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  const [warning, setWarning] = useState<string | null>(null);
-  const [savedFilename, setSavedFilename] = useState<string | null>(null);
-  const [saveDestination, setSaveDestination] = useState<"folder" | "download" | null>(null);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [mediaUrl, setMediaUrl] = useState<string | null>(null);
-  const [previewError, setPreviewError] = useState(false);
-  const [dragX, setDragX] = useState(0);
+  const [mode, setMode] = useState<QueueMode>("unrated");
+  const [status, setStatus] = useState<LoadStatus>("loading");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [pending, setPending] = useState<QueueItem[]>([]);
+  const [historyLength, setHistoryLength] = useState(0);
+  const [stats, setStats] = useState<RatingStats | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [drag, setDrag] = useState<DragOffset>(NO_DRAG);
   const [dragging, setDragging] = useState(false);
-  const [isPlaying, setIsPlaying] = useState(true);
-  const [isMuted, setIsMuted] = useState(true);
-  const [duration, setDuration] = useState(0);
-  const [currentTime, setCurrentTime] = useState(0);
+  const [failedSha, setFailedSha] = useState<string | null>(null);
+  const [pausedSha, setPausedSha] = useState<string | null>(null);
+  const [muted, setMuted] = useState(true);
 
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const dragStartRef = useRef<{ x: number; pointerId: number } | null>(null);
-  const busyRef = useRef(false);
-  const saveInFlightRef = useRef(false);
+  // Refs mirror state so rapid key presses always act on the latest queue.
+  const pendingRef = useRef<QueueItem[]>([]);
+  const historyRef = useRef<HistoryEntry[]>([]);
+  const reviewedRef = useRef(new Set<string>());
+  const requestChainRef = useRef<Promise<void>>(Promise.resolve());
+  const generationRef = useRef(0);
+  const modeRef = useRef(mode);
+  const dragStartRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
 
-  const currentItem = items[currentIndex] ?? null;
-  const decisions = session?.decisions ?? EMPTY_DECISIONS;
-  const keepCount = useMemo(
-    () => Object.values(decisions).filter((value) => value.decision === "keep").length,
-    [decisions],
-  );
-  const rejectCount = useMemo(
-    () => Object.values(decisions).filter((value) => value.decision === "reject").length,
-    [decisions],
-  );
-  const progress = items.length ? (currentIndex / items.length) * 100 : 0;
-
-  useEffect(() => {
-    const frame = requestAnimationFrame(() => {
-      setSupported("showDirectoryPicker" in window);
-    });
-    return () => cancelAnimationFrame(frame);
+  const commitPending = useCallback((next: QueueItem[]) => {
+    pendingRef.current = next;
+    setPending(next);
   }, []);
 
-  useEffect(() => {
-    let disposed = false;
-    let nextUrl: string | null = null;
-
-    if (!currentItem || phase !== "reviewing") {
-      queueMicrotask(() => {
-        if (!disposed) setMediaUrl(null);
-      });
-      return () => {
-        disposed = true;
-      };
-    }
-
-    queueMicrotask(() => {
-      if (disposed) return;
-      setPreviewError(false);
-      setMediaUrl(null);
-      setCurrentTime(0);
-      setDuration(0);
-      setIsPlaying(true);
-      setIsMuted(true);
-    });
-
-    currentItem.handle
-      .getFile()
-      .then((file) => {
-        if (disposed) return;
-        nextUrl = URL.createObjectURL(file);
-        setMediaUrl(nextUrl);
-      })
-      .catch(() => {
-        if (!disposed) setPreviewError(true);
-      });
-
-    return () => {
-      disposed = true;
-      if (nextUrl) URL.revokeObjectURL(nextUrl);
-    };
-  }, [currentItem, phase]);
-
-  const persistSession = useCallback(async (nextSession: ReviewSessionV1) => {
-    setSession(nextSession);
-    const saved = await saveReviewSession(nextSession);
-    if (!saved) {
-      setWarning("途中経過を保存できません。このタブは閉じずに続けてください。");
-    }
+  const commitHistory = useCallback((next: HistoryEntry[]) => {
+    historyRef.current = next;
+    setHistoryLength(next.length);
   }, []);
 
-  const beginNewReview = useCallback(
-    async (folder: PendingFolder, replaceSession?: ReviewSessionV1) => {
-      if (replaceSession) await deleteReviewSession(replaceSession.id);
-      const seed = createSeed();
-      const orderedItems = sortMediaItems(folder.scan.items, folder.sortMode, seed);
-      const nextSession = makeSession(
-        folder.rootHandle,
-        folder.fingerprint,
-        folder.includeSubfolders,
-        folder.sortMode,
-        seed,
-        orderedItems,
-      );
-      setIncludeSubfolders(folder.includeSubfolders);
-      setSortMode(folder.sortMode);
-      setRootHandle(folder.rootHandle);
-      setItems(orderedItems);
-      setCurrentIndex(0);
-      setScanSummary(folder.scan);
-      setPendingFolder(null);
-      setResumeCandidate(null);
-      setMessage(null);
-      setWarning(null);
-      setSavedFilename(null);
-      setSaveDestination(null);
-      setSaveError(null);
-      await persistSession(nextSession);
-      setPhase("reviewing");
-    },
-    [persistSession],
-  );
-
-  const resumeReview = useCallback(async () => {
-    if (!pendingFolder || !resumeCandidate) return;
-    const byPath = new Map(
-      pendingFolder.scan.items.map((item) => [item.relativePath, item]),
-    );
-    const orderedItems = resumeCandidate.orderedPaths
-      .map((path) => byPath.get(path))
-      .filter((item): item is MediaItem => Boolean(item));
-
-    if (orderedItems.length !== pendingFolder.scan.items.length) {
-      setMessage("フォルダの内容が変わったため、最初から仕分けを開始します。");
-      await beginNewReview(pendingFolder, resumeCandidate);
-      return;
-    }
-
-    setSortMode(resumeCandidate.sortMode);
-    setIncludeSubfolders(resumeCandidate.includeSubfolders);
-    setRootHandle(pendingFolder.rootHandle);
-    setItems(orderedItems);
-    setCurrentIndex(resumeCandidate.history.length);
-    setSession({ ...resumeCandidate, rootHandle: pendingFolder.rootHandle });
-    setScanSummary(pendingFolder.scan);
-    setPendingFolder(null);
-    setResumeCandidate(null);
-    setWarning(null);
-    setSavedFilename(null);
-    setSaveDestination(null);
-    setSaveError(null);
-    setPhase(
-      resumeCandidate.history.length >= orderedItems.length
-        ? "complete"
-        : "reviewing",
-    );
-  }, [beginNewReview, pendingFolder, resumeCandidate]);
-
-  const chooseFolder = useCallback(async () => {
-    if (phase === "saving" || saveInFlightRef.current) return;
-    if (!("showDirectoryPicker" in window)) {
-      setSupported(false);
-      return;
-    }
-
-    const scanIncludesSubfolders = includeSubfolders === true;
-    const scanSortMode = sortMode;
-
-    try {
-      const handle = await window.showDirectoryPicker({
-        id: "media-review-root",
-        mode: "read",
-        startIn: "pictures",
-      });
-      setPhase("scanning");
-      setMessage(null);
-      setWarning(null);
-      const scan = await scanMediaDirectory(handle, {
-        recursive: scanIncludesSubfolders,
-      });
-
-      if (scan.items.length === 0) {
-        setScanSummary(scan);
-        setPhase("idle");
-        setMessage(
-          scan.errors.length
-            ? "フォルダを読み取れませんでした。権限を確認して、もう一度選んでください。"
-            : "対応している画像・動画が見つかりませんでした。",
-        );
-        return;
-      }
-
-      const fingerprint = await createManifestFingerprint(
-        handle.name,
-        scanIncludesSubfolders,
-        scan.items,
-      );
-      const folder = {
-        rootHandle: handle,
-        scan,
-        fingerprint,
-        includeSubfolders: scanIncludesSubfolders,
-        sortMode: scanSortMode,
-      };
-      const matching = await findMatchingSession({
-        rootHandle: handle,
-        manifestFingerprint: fingerprint,
-        includeSubfolders: scanIncludesSubfolders,
-      });
-
-      if (
-        matching &&
-        !matching.completedAt &&
-        matching.history.length > 0 &&
-        matching.history.length <= matching.orderedPaths.length
-      ) {
-        setPendingFolder(folder);
-        setResumeCandidate(matching);
-        setPhase("resume");
-        return;
-      }
-
-      await beginNewReview(folder, matching ?? undefined);
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") return;
-      setPhase("idle");
-      setMessage("フォルダを開けませんでした。Chromeのフォルダ権限を確認してください。");
-    }
-  }, [beginNewReview, includeSubfolders, phase, sortMode]);
-
-  const saveCompletedReview = useCallback(
-    async (nextSession: ReviewSessionV1) => {
-      if (!rootHandle || saveInFlightRef.current) return;
-      saveInFlightRef.current = true;
-      setPhase("saving");
-      setSaveError(null);
+  const loadQueue = useCallback(
+    async (reset: boolean) => {
+      const generation = reset ? ++generationRef.current : generationRef.current;
+      const requestedMode = modeRef.current;
       try {
-        const writableRootHandle = await getWritableDirectoryHandle(rootHandle);
-        const rows = createCsvDecisionRows(items, nextSession.decisions);
-        const saveResult = await saveDecisionsCsv(writableRootHandle, rows);
-        const now = new Date().toISOString();
-        const completed = { ...nextSession, updatedAt: now, completedAt: now };
-        await persistSession(completed);
-        setSavedFilename(saveResult.filename);
-        setSaveDestination(saveResult.destination);
-        setPhase("complete");
-      } catch {
-        setSaveError("CSVを保存できませんでした。権限を確認して再試行してください。");
-        setPhase("complete");
-      } finally {
-        saveInFlightRef.current = false;
+        // Let queued rating writes land first so the server's view is current.
+        await requestChainRef.current;
+        const response = await fetchQueue(requestedMode);
+        if (generation !== generationRef.current) return;
+
+        setStats(response.stats);
+        setScanError(response.scanError);
+        if (reset) {
+          reviewedRef.current = new Set();
+          commitHistory([]);
+          commitPending(response.items);
+        } else {
+          // Drop items rated elsewhere (except the one on screen) and append new arrivals.
+          const fresh = new Map(response.items.map((item) => [item.sha256, item]));
+          const kept = pendingRef.current
+            .filter((item, index) => index === 0 || fresh.has(item.sha256))
+            .map((item) => fresh.get(item.sha256) ?? item);
+          const keptShas = new Set(kept.map((item) => item.sha256));
+          const additions = response.items.filter(
+            (item) => !keptShas.has(item.sha256) && !reviewedRef.current.has(item.sha256),
+          );
+          commitPending([...kept, ...additions]);
+        }
+        setLoadError(null);
+        setStatus("ready");
+      } catch (error) {
+        if (generation !== generationRef.current) return;
+        if (reset) {
+          setLoadError(errorMessage(error));
+          setStatus("error");
+        } else {
+          setNotice(`新着を確認できませんでした（${errorMessage(error)}）`);
+        }
       }
     },
-    [items, persistSession, rootHandle],
+    [commitHistory, commitPending],
   );
+
+  useEffect(() => {
+    modeRef.current = mode;
+    void loadQueue(true);
+  }, [mode, loadQueue]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void loadQueue(false);
+    }, REFRESH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [loadQueue]);
+
+  /** Sends writes one at a time so a quick rate-then-undo reaches the server in order. */
+  const enqueueRequest = useCallback(
+    (send: () => Promise<void>) => {
+      requestChainRef.current = requestChainRef.current.then(send).catch((error: unknown) => {
+        setNotice(`評価を保存できませんでした（${errorMessage(error)}）。一覧を読み直しました。`);
+        window.setTimeout(() => {
+          void loadQueue(true);
+        }, 0);
+      });
+    },
+    [loadQueue],
+  );
+
+  const resetDrag = useCallback(() => {
+    dragStartRef.current = null;
+    setDrag(NO_DRAG);
+    setDragging(false);
+  }, []);
 
   const decide = useCallback(
-    async (decision: Decision) => {
-      if (!session || !currentItem || phase !== "reviewing" || busyRef.current) return;
-      busyRef.current = true;
-      const decidedAt = new Date().toISOString();
-      const record: ReviewDecision = { decision, decidedAt };
-      const previousDecision = session.decisions[currentItem.relativePath];
-      const nextIndex = currentIndex + 1;
-      const nextSession: ReviewSessionV1 = {
-        ...session,
-        decisions: {
-          ...session.decisions,
-          [currentItem.relativePath]: record,
-        },
-        history: [
-          ...session.history,
-          {
-            relativePath: currentItem.relativePath,
-            ...record,
-            ...(previousDecision ? { previousDecision } : {}),
-          },
-        ],
-        updatedAt: decidedAt,
-        completedAt: null,
-      };
-
-      setDragX(decision === "keep" ? window.innerWidth : -window.innerWidth);
-      await persistSession(nextSession);
-      setCurrentIndex(nextIndex);
-      setDragX(0);
-      setDragging(false);
-
-      if (nextIndex >= items.length) setPhase("complete");
-      busyRef.current = false;
+    (rating: Rating) => {
+      const [item, ...rest] = pendingRef.current;
+      if (!item) return;
+      commitPending(rest);
+      commitHistory(
+        [...historyRef.current, { item, previous: item.rating, next: rating }].slice(
+          -HISTORY_LIMIT,
+        ),
+      );
+      reviewedRef.current.add(item.sha256);
+      setStats((current) => adjustStats(current, item.rating, rating));
+      resetDrag();
+      enqueueRequest(() => putRating(item.sha256, rating));
     },
-    [currentIndex, currentItem, items.length, persistSession, phase, session],
+    [commitHistory, commitPending, enqueueRequest, resetDrag],
   );
 
-  const undo = useCallback(async () => {
-    if (
-      phase === "saving" ||
-      saveInFlightRef.current ||
-      !session ||
-      session.history.length === 0 ||
-      busyRef.current
-    ) {
-      return;
-    }
-    busyRef.current = true;
-    const history = [...session.history];
-    const last = history.pop();
-    if (!last) {
-      busyRef.current = false;
-      return;
-    }
-    const nextDecisions = { ...session.decisions };
-    if (last.previousDecision) {
-      nextDecisions[last.relativePath] = last.previousDecision;
-    } else {
-      delete nextDecisions[last.relativePath];
-    }
-    const now = new Date().toISOString();
-    const nextSession: ReviewSessionV1 = {
-      ...session,
-      decisions: nextDecisions,
-      history,
-      updatedAt: now,
-      completedAt: null,
-    };
-    setSavedFilename(null);
-    setSaveDestination(null);
-    setSaveError(null);
-    setCurrentIndex(history.length);
-    setPhase("reviewing");
-    await persistSession(nextSession);
-    busyRef.current = false;
-  }, [persistSession, phase, session]);
-
-  const saveCsv = useCallback(async () => {
-    if (
-      phase !== "complete" ||
-      saveInFlightRef.current ||
-      !session ||
-      session.history.length !== items.length
-    ) {
-      return;
-    }
-    await saveCompletedReview(session);
-  }, [items.length, phase, saveCompletedReview, session]);
+  const undo = useCallback(() => {
+    const entry = historyRef.current.at(-1);
+    if (!entry) return;
+    const { item, previous, next } = entry;
+    commitHistory(historyRef.current.slice(0, -1));
+    commitPending([item, ...pendingRef.current.filter((other) => other.sha256 !== item.sha256)]);
+    reviewedRef.current.delete(item.sha256);
+    setStats((current) => adjustStats(current, next, previous));
+    resetDrag();
+    enqueueRequest(() =>
+      previous === null ? deleteRating(item.sha256) : putRating(item.sha256, previous),
+    );
+  }, [commitHistory, commitPending, enqueueRequest, resetDrag]);
 
   const toggleVideo = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
-      void video.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
+      setPausedSha(null);
+      void video.play()?.catch(() => undefined);
     } else {
       video.pause();
-      setIsPlaying(false);
+      setPausedSha(video.dataset.sha ?? null);
     }
   }, []);
 
-  const toggleMute = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.muted = !video.muted;
-    setIsMuted(video.muted);
-  }, []);
+  const currentSha = pending[0]?.sha256 ?? null;
+
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.muted = muted;
+  }, [muted, currentSha]);
+
+  useEffect(() => {
+    for (const item of pending.slice(1, 1 + PRELOAD_COUNT)) {
+      if (item.kind === "image") new Image().src = mediaUrl(item.sha256);
+    }
+  }, [pending]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (isInteractiveTarget(event.target)) return;
-      if (event.repeat) return;
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
-        event.preventDefault();
-        void undo();
+      if (event.repeat || event.altKey || isTextEntryTarget(event.target)) return;
+      if (event.metaKey || event.ctrlKey) {
+        if (event.key.toLowerCase() === "z") {
+          event.preventDefault();
+          undo();
+        }
         return;
       }
-      if (event.key === "Backspace") {
+      const rating = KEY_TO_RATING.get(event.key);
+      if (rating) {
         event.preventDefault();
-        void undo();
-      } else if (event.key === "ArrowLeft") {
+        decide(rating);
+      } else if (event.key === "Backspace") {
         event.preventDefault();
-        void decide("reject");
-      } else if (event.key === "ArrowRight") {
-        event.preventDefault();
-        void decide("keep");
-      } else if (event.code === "Space" && currentItem?.kind === "video") {
+        undo();
+      } else if (event.code === "Space" && !isControlTarget(event.target)) {
         event.preventDefault();
         toggleVideo();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [currentItem?.kind, decide, toggleVideo, undo]);
+  }, [decide, toggleVideo, undo]);
 
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (phase !== "reviewing" || busyRef.current || isInteractiveTarget(event.target)) return;
-    dragStartRef.current = { x: event.clientX, pointerId: event.pointerId };
-    event.currentTarget.setPointerCapture(event.pointerId);
+    if (event.button !== 0 || isControlTarget(event.target)) return;
+    dragStartRef.current = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
     setDragging(true);
   };
 
   const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!dragStartRef.current || dragStartRef.current.pointerId !== event.pointerId) return;
-    setDragX(event.clientX - dragStartRef.current.x);
-  };
-
-  const onPointerEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
     const start = dragStartRef.current;
     if (!start || start.pointerId !== event.pointerId) return;
-    dragStartRef.current = null;
-    const delta = event.clientX - start.x;
-    const threshold = event.currentTarget.getBoundingClientRect().width * 0.25;
-    if (Math.abs(delta) >= threshold) {
-      void decide(delta > 0 ? "keep" : "reject");
-      return;
-    }
-    setDragX(0);
-    setDragging(false);
+    setDrag({ x: event.clientX - start.x, y: event.clientY - start.y });
   };
 
-  const onPointerCancel = () => {
-    dragStartRef.current = null;
-    setDragX(0);
-    setDragging(false);
+  const onPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const start = dragStartRef.current;
+    if (!start || start.pointerId !== event.pointerId) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const rating = ratingFromDrag(
+      { x: event.clientX - start.x, y: event.clientY - start.y },
+      rect.width,
+      rect.height,
+    );
+    if (rating) decide(rating);
+    else resetDrag();
   };
 
+  const onModeChange = (event: ChangeEvent<HTMLSelectElement>) => {
+    setStatus("loading");
+    setMode(event.target.value as QueueMode);
+  };
+
+  const retry = () => {
+    setStatus("loading");
+    void loadQueue(true);
+  };
+
+  const current = pending[0] ?? null;
+  const direction = dragDirection(drag);
+  const dragStrength = Math.min(Math.max(Math.abs(drag.x), -drag.y) / 180, 1);
   const dragStyle: DragStyle = {
-    "--drag-x": `${dragX}px`,
-    "--drag-rotation": `${dragX / 48}deg`,
+    "--drag-x": `${drag.x}px`,
+    "--drag-y": `${Math.min(drag.y, 0)}px`,
+    "--drag-rotation": `${drag.x / 48}deg`,
   };
-  const dragStrength = Math.min(Math.abs(dragX) / 180, 1);
-  const ignoredExtensions = scanSummary
-    ? Object.entries(scanSummary.ignoredExtensions)
-        .map(([extension, count]) => `.${extension} ${count}件`)
-        .join("、")
-    : "";
 
-  if (phase === "scanning") {
-    return (
-      <main className="center-shell" aria-live="polite">
-        <div className="scan-indicator" aria-hidden="true" />
-        <p className="step-label">フォルダを確認中</p>
-        <h1 className="state-title">メディアを探しています</h1>
-        <p className="state-copy">ファイルはこの端末から送信されません。</p>
-      </main>
-    );
-  }
-
-  if (phase === "resume" && pendingFolder && resumeCandidate) {
-    return (
-      <main className="center-shell">
-        <p className="step-label">途中の仕分けが見つかりました</p>
-        <h1 className="state-title">{pendingFolder.rootHandle.name}</h1>
-        <p className="state-copy">
-          {resumeCandidate.history.length} / {resumeCandidate.orderedPaths.length} 件まで完了しています。
-          <br />前回の「{sortLabels[resumeCandidate.sortMode]}」を引き継げます。
-        </p>
-        <div className="state-actions">
-          <button className="primary-action" type="button" onClick={() => void resumeReview()}>
-            続きから
-          </button>
+  return (
+    <div className="review-shell">
+      <header className="review-header">
+        <div className="review-brand">
+          <span className="brand-mark" aria-hidden="true" />
+          <span className="app-name">MARIN 評価</span>
+        </div>
+        <div className="header-actions">
+          <label className="mode-field">
+            <span className="sr-only">表示する対象</span>
+            <select value={mode} onChange={onModeChange}>
+              {MODE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
           <button
-            className="secondary-action"
             type="button"
-            onClick={() => void beginNewReview(pendingFolder, resumeCandidate)}
+            className="header-button"
+            onClick={undo}
+            disabled={historyLength === 0}
           >
-            最初から
+            取り消し
           </button>
+          <a className="header-button" href="/api/export.csv" download>
+            CSV
+          </a>
         </div>
-      </main>
-    );
-  }
+      </header>
 
-  if ((phase === "complete" || phase === "saving") && session) {
-    return (
-      <main className="center-shell complete-shell" aria-busy={phase === "saving"}>
-        <div className="complete-mark" aria-hidden="true">✓</div>
-        <p className="step-label">仕分け完了</p>
-        <h1 className="state-title">{items.length}件を判定しました</h1>
-        <div className="result-counts">
-          <span><strong>{keepCount}</strong> いる</span>
-          <span><strong>{rejectCount}</strong> いらない</span>
-        </div>
-        <ScanErrorNotice errors={scanSummary?.errors ?? []} />
-        {phase === "saving" ? (
-          <p className="state-copy">CSVを保存しています…</p>
-        ) : savedFilename ? (
-          <p className="state-copy">
-            <strong>{savedFilename}</strong><br />
-            {saveDestination === "folder"
-              ? "を選択フォルダへ保存しました。"
-              : "のダウンロードを開始しました。"}
+      <p className="stats-bar" aria-live="polite">
+        {status === "ready" ? (
+          <span>
+            残り <strong>{pending.length}</strong>
+          </span>
+        ) : null}
+        {stats ? (
+          <>
+            <span className="stat-reject">✕ {stats.reject}</span>
+            <span className="stat-hold">△ {stats.hold}</span>
+            <span className="stat-keep">◯ {stats.keep}</span>
+            <span>未評価 {stats.unrated}</span>
+          </>
+        ) : null}
+      </p>
+
+      {status === "loading" ? (
+        <main className="center-shell">
+          <div className="scan-indicator" aria-hidden="true" />
+          <p className="state-copy" role="status">
+            読み込んでいます…
           </p>
-        ) : saveError ? (
-          <p className="error-message">{saveError}</p>
-        ) : (
-          <p className="state-copy">
-            保存時にフォルダへの書き込み許可を確認します。許可しない場合はダウンロードします。
-          </p>
-        )}
-        <div className="state-actions">
-          {!savedFilename && (
-            <button
-              className="primary-action"
-              type="button"
-              onClick={() => void saveCsv()}
-              disabled={phase === "saving"}
-            >
-              {phase === "saving"
-                ? "CSVを保存中"
-                : saveError
-                  ? "CSV保存を再試行"
-                  : "CSVを保存"}
-            </button>
-          )}
-          <button
-            className="secondary-action"
-            type="button"
-            onClick={() => void undo()}
-            disabled={phase === "saving"}
-          >
-            最後の判定に戻る
-          </button>
-          <button
-            className="text-action"
-            type="button"
-            onClick={() => void chooseFolder()}
-            disabled={phase === "saving"}
-          >
-            別のフォルダを選ぶ
-          </button>
-        </div>
-      </main>
-    );
-  }
-
-  if (phase === "reviewing" && currentItem) {
-    return (
-      <main className="review-shell">
-        <header className="review-header">
-          <div className="review-brand">
-            <span className="brand-mark" aria-hidden="true" />
-            <span className="folder-name">{rootHandle?.name}</span>
-            <span className="scope-badge">
-              {session?.includeSubfolders ? "サブフォルダ込み" : "直下のみ"}
-            </span>
-          </div>
-          <div className="progress-copy" aria-live="polite">
-            <strong>{currentIndex + 1}</strong> / {items.length}
-          </div>
-          <div className="header-actions">
-            <button className="header-button" type="button" onClick={() => void undo()} disabled={!session?.history.length}>
-              元に戻す
-            </button>
-            <button className="header-button" type="button" onClick={() => void chooseFolder()}>
-              別のフォルダ
+        </main>
+      ) : status === "error" ? (
+        <main className="center-shell">
+          <h1 className="state-title">読み込めませんでした</h1>
+          <p className="state-copy">{loadError}</p>
+          <div className="state-actions">
+            <button type="button" className="primary-action" onClick={retry}>
+              もう一度読み込む
             </button>
           </div>
-        </header>
-        <div className="progress-track" aria-hidden="true">
-          <span style={{ width: `${progress}%` }} />
-        </div>
-        <ScanErrorNotice errors={scanSummary?.errors ?? []} />
-
-        <section className="review-workbench">
-          <button className="edge-action reject-edge" type="button" onClick={() => void decide("reject")}>
-            <span>←</span><strong>いらない</strong><small>{rejectCount}</small>
-          </button>
-
-          <div className="media-column">
+        </main>
+      ) : current ? (
+        <>
+          <main className="review-stage">
             <div
               className={`media-card${dragging ? " is-dragging" : ""}`}
               style={dragStyle}
               onPointerDown={onPointerDown}
               onPointerMove={onPointerMove}
-              onPointerUp={onPointerEnd}
-              onPointerCancel={onPointerCancel}
+              onPointerUp={onPointerUp}
+              onPointerCancel={resetDrag}
             >
-              <div
-                className="decision-stamp reject-stamp"
-                style={{ opacity: dragX < 0 ? dragStrength : 0 }}
-              >
-                いらない
-              </div>
-              <div
-                className="decision-stamp keep-stamp"
-                style={{ opacity: dragX > 0 ? dragStrength : 0 }}
-              >
-                いる
-              </div>
-              {mediaUrl && !previewError ? (
-                currentItem.kind === "image" ? (
-                  <img src={mediaUrl} alt={currentItem.name} draggable={false} onError={() => setPreviewError(true)} />
-                ) : (
-                  <video
-                    ref={videoRef}
-                    src={mediaUrl}
-                    autoPlay
-                    muted
-                    loop
-                    playsInline
-                    preload="metadata"
-                    onPlay={() => setIsPlaying(true)}
-                    onPause={() => setIsPlaying(false)}
-                    onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
-                    onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-                    onError={() => setPreviewError(true)}
-                  />
-                )
-              ) : previewError ? (
+              {direction && dragStrength > 0.05 ? (
+                <span
+                  className={`decision-stamp ${direction}-stamp`}
+                  style={{ opacity: dragStrength }}
+                  aria-hidden="true"
+                >
+                  {RATING_SYMBOLS[direction]} {RATING_LABELS[direction]}
+                </span>
+              ) : null}
+              {failedSha === current.sha256 ? (
                 <div className="preview-error">
-                  <strong>プレビューできません</strong>
-                  <span>ファイル名を確認して判定できます。</span>
+                  <strong>表示できません</strong>
+                  <span>ファイル名を確認して評価できます</span>
                 </div>
+              ) : current.kind === "image" ? (
+                // eslint-disable-next-line @next/next/no-img-element -- plain Vite SPA; next/image does not apply
+                <img
+                  key={current.sha256}
+                  src={mediaUrl(current.sha256)}
+                  alt={current.relPath}
+                  draggable={false}
+                  onError={() => setFailedSha(current.sha256)}
+                />
               ) : (
-                <div className="media-loading" aria-label="メディアを読み込み中" />
+                <video
+                  key={current.sha256}
+                  ref={videoRef}
+                  data-sha={current.sha256}
+                  src={mediaUrl(current.sha256)}
+                  aria-label={current.relPath}
+                  autoPlay
+                  loop
+                  muted
+                  playsInline
+                  preload="auto"
+                  onError={() => setFailedSha(current.sha256)}
+                />
               )}
             </div>
-
             <div className="media-caption">
               <div>
-                <strong title={currentItem.relativePath}>{currentItem.name}</strong>
-                <span>{formatBytes(currentItem.sizeBytes)} ・ {currentItem.kind === "image" ? "画像" : "動画"}</span>
+                <strong title={current.relPath}>{current.relPath}</strong>
+                <span>
+                  {modifiedFormatter.format(current.mtimeMs)} ・ {formatBytes(current.sizeBytes)}
+                  {current.rating ? ` ・ 現在の評価: ${RATING_LABELS[current.rating]}` : ""}
+                </span>
               </div>
-              {currentItem.kind === "video" && (
+              {current.kind === "video" && failedSha !== current.sha256 ? (
                 <div className="video-controls">
-                  <button type="button" onClick={toggleVideo}>{isPlaying ? "一時停止" : "再生"}</button>
-                  <input
-                    aria-label="動画の再生位置"
-                    type="range"
-                    min="0"
-                    max={Math.max(duration, 0)}
-                    step="0.1"
-                    value={Math.min(currentTime, duration || 0)}
-                    onChange={(event) => {
-                      const nextTime = Number(event.currentTarget.value);
-                      if (videoRef.current) videoRef.current.currentTime = nextTime;
-                      setCurrentTime(nextTime);
-                    }}
-                  />
-                  <button type="button" onClick={toggleMute}>{isMuted ? "音を出す" : "消音"}</button>
+                  <button type="button" onClick={toggleVideo}>
+                    {pausedSha === current.sha256 ? "再生" : "一時停止"}
+                  </button>
+                  <button type="button" onClick={() => setMuted((value) => !value)}>
+                    {muted ? "音声オン" : "消音"}
+                  </button>
                 </div>
-              )}
+              ) : null}
             </div>
-            <p className="shortcut-hint">← いらない / → いる / ⌘Z 元に戻す</p>
+          </main>
+          <nav className="rating-bar" aria-label="評価">
+            {BUTTON_ORDER.map((rating) => (
+              <button
+                key={rating}
+                type="button"
+                className={`rating-button ${rating}`}
+                aria-keyshortcuts={RATING_KEYS[rating]}
+                onClick={() => decide(rating)}
+              >
+                <span aria-hidden="true">{RATING_SYMBOLS[rating]}</span>
+                {RATING_LABELS[rating]}
+              </button>
+            ))}
+          </nav>
+          <p className="shortcut-hint">← バツ ・ ↓ 保留 ・ → マル ・ Backspace で取り消し</p>
+        </>
+      ) : (
+        <main className="center-shell">
+          <div className="complete-mark" aria-hidden="true">
+            ✓
           </div>
+          <h1 className="state-title">
+            {mode === "hold" ? "保留はありません" : "評価待ちはありません"}
+          </h1>
+          <p className="state-copy">新しい画像・動画が届いていないか、30秒ごとに確認しています。</p>
+        </main>
+      )}
 
-          <button className="edge-action keep-edge" type="button" onClick={() => void decide("keep")}>
-            <span>→</span><strong>いる</strong><small>{keepCount}</small>
-          </button>
-        </section>
-        {warning && <p className="floating-warning" role="status">{warning}</p>}
-      </main>
-    );
-  }
-
-  return (
-    <main className="landing-shell">
-      <header className="brand-line">
-        <span className="brand-mark" aria-hidden="true" />
-        <span>メディア仕分け</span>
-        <span className="privacy-note">端末内だけで処理</span>
-      </header>
-      <section className="intro-stage">
-        <div className="intro-copy">
-          <p className="step-label">フォルダをひとつ選ぶ</p>
-          <h1>残したい一枚を、<br />迷わず選ぶ。</h1>
-          <p className="intro-description">
-            画像と動画を左右に仕分け、最後に判定結果をCSVで保存します。
-            元のメディアは変更しません。
-          </p>
-
-          <div className="review-options">
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={includeSubfolders}
-                onChange={(event) => setIncludeSubfolders(event.currentTarget.checked)}
-              />
-              <span className="toggle-control" aria-hidden="true" />
-              <span>サブフォルダも含める</span>
-            </label>
-            <label className="sort-field">
-              <span>表示順</span>
-              <select value={sortMode} onChange={(event) => setSortMode(event.currentTarget.value as SortMode)}>
-                {Object.entries(sortLabels).map(([value, label]) => (
-                  <option key={value} value={value}>{label}</option>
-                ))}
-              </select>
-            </label>
-          </div>
-
-          <button className="folder-button" type="button" onClick={() => void chooseFolder()} disabled={supported === false}>
-            フォルダを選ぶ
-          </button>
-          {supported === false ? (
-            <p className="error-message">この機能はChromeまたはEdgeで開いてください。</p>
-          ) : (
-            <p className="support-note">Chrome / Edge ・ JPG / PNG / WebP / GIF / AVIF / MP4 / WebM</p>
-          )}
-          {message && <p className="error-message" role="status">{message}</p>}
-          {scanSummary && scanSummary.ignoredCount > 0 && (
-            <p className="ignored-note">
-              対象外 {scanSummary.ignoredCount}件{ignoredExtensions ? `（${ignoredExtensions}）` : ""}
+      {scanError || notice ? (
+        <div className="floating-stack">
+          {scanError ? (
+            <p className="floating-warning" role="alert">
+              フォルダを読み込めません: {scanError}
             </p>
-          )}
+          ) : null}
+          {notice ? (
+            <p className="floating-warning" role="alert">
+              {notice}
+              <button type="button" onClick={() => setNotice(null)}>
+                閉じる
+              </button>
+            </p>
+          ) : null}
         </div>
-
-        <div className="preview-board" aria-label="仕分け操作のプレビュー">
-          <span className="decision-rail reject">← いらない</span>
-          <div className="preview-frame">
-            <div className="preview-sun" />
-            <div className="preview-horizon" />
-            <span>IMG_0248.JPG</span>
-          </div>
-          <span className="decision-rail keep">いる →</span>
-        </div>
-      </section>
-    </main>
+      ) : null}
+    </div>
   );
 }

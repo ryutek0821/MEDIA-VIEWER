@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ryuheitakeda.media-viewer</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/ryuheitakeda/ClaudeCode/MEDIA-VIEWER/server/index.ts</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/ryuheitakeda/ClaudeCode/MEDIA-VIEWER</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>HOST</key>
+    <string>127.0.0.1</string>
+    <key>PORT</key>
+    <string>8792</string>
+    <key>MEDIA_ROOT</key>
+    <string>/Users/ryuheitakeda/ClaudeCode/PROJECT-MARIN/output</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/ryuheitakeda/Library/Logs/MediaViewer/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ryuheitakeda/Library/Logs/MediaViewer/server-error.log</string>
+</dict>
+</plist>
