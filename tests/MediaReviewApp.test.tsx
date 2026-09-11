@@ -95,23 +95,33 @@ describe("MediaReviewApp", () => {
     expect(api.putRating).not.toHaveBeenCalled();
   });
 
-  it("undoes the last rating and restores the previous value", async () => {
-    api.fetchQueue.mockResolvedValue(queueResponse([item("a", "hold"), item("b")]));
+  it("goes back one item without losing its rating, and re-rating overwrites it", async () => {
     const user = userEvent.setup();
     render(<MediaReviewApp />);
 
     await screen.findByRole("img", { name: "batch/a.png" });
+    expect(screen.getByRole("button", { name: "戻る" })).toBeDisabled();
     await user.keyboard("{ArrowRight}");
     await screen.findByRole("img", { name: "batch/b.png" });
-    await user.keyboard("{ArrowRight}");
-    await user.keyboard("{Backspace}");
-    expect(await screen.findByRole("img", { name: "batch/b.png" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "取り消し" }));
-    expect(await screen.findByRole("img", { name: "batch/a.png" })).toBeInTheDocument();
+    await user.keyboard("{ArrowDown}");
+    expect(await screen.findByRole("heading", { name: "評価待ちはありません" })).toBeInTheDocument();
 
+    await user.click(screen.getByRole("button", { name: "↩ 1枚戻る" }));
+    expect(await screen.findByRole("img", { name: "batch/b.png" })).toBeInTheDocument();
+    expect(screen.getByText(/現在の評価: 保留/)).toBeInTheDocument();
+
+    await user.keyboard("{Backspace}");
+    expect(await screen.findByRole("img", { name: "batch/a.png" })).toBeInTheDocument();
+    expect(screen.getByText(/現在の評価: マル/)).toBeInTheDocument();
+    expect(screen.getByText("◯ 1")).toBeInTheDocument();
+
+    await user.keyboard("{ArrowLeft}");
     await waitFor(() => expect(api.putRating).toHaveBeenCalledTimes(3));
-    expect(api.deleteRating).toHaveBeenCalledWith("sha-b");
-    expect(api.putRating).toHaveBeenLastCalledWith("sha-a", "hold");
+    expect(api.putRating).toHaveBeenLastCalledWith("sha-a", "reject");
+    expect(api.deleteRating).not.toHaveBeenCalled();
+    expect(screen.getByText("◯ 0")).toBeInTheDocument();
+    expect(screen.getByText("✕ 1")).toBeInTheDocument();
+    expect(await screen.findByRole("img", { name: "batch/b.png" })).toBeInTheDocument();
   });
 
   it("reloads the queue and explains when a rating cannot be saved", async () => {

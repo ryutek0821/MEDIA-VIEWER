@@ -5,10 +5,11 @@ import {
   useState,
   type ChangeEvent,
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import type { QueueItem, QueueMode, Rating, RatingStats } from "../lib/media.ts";
-import { deleteRating, fetchQueue, mediaUrl, putRating } from "./api.ts";
+import { fetchQueue, mediaUrl, putRating } from "./api.ts";
 
 const REFRESH_INTERVAL_MS = 30_000;
 const HISTORY_LIMIT = 200;
@@ -52,8 +53,7 @@ interface DragOffset {
 
 interface HistoryEntry {
   item: QueueItem;
-  previous: Rating | null;
-  next: Rating;
+  rating: Rating;
 }
 
 const NO_DRAG: DragOffset = { x: 0, y: 0 };
@@ -117,6 +117,11 @@ function ratingFromDrag(offset: DragOffset, width: number, height: number): Rati
 function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** After a mouse/touch click, a focused button would turn a later Space into another click. */
+function releasePointerFocus(event: ReactMouseEvent<HTMLButtonElement>): void {
+  if (event.detail > 0) event.currentTarget.blur();
 }
 
 export default function MediaReviewApp() {
@@ -187,7 +192,7 @@ export default function MediaReviewApp() {
       } catch (error) {
         if (generation !== generationRef.current) return;
         if (reset) {
-          // Nothing stale may stay rateable (by key or undo) behind the error screen.
+          // Nothing stale may stay rateable (by key or going back) behind the error screen.
           commitPending([]);
           commitHistory([]);
           setLoadError(errorMessage(error));
@@ -212,7 +217,7 @@ export default function MediaReviewApp() {
     return () => window.clearInterval(timer);
   }, [loadQueue]);
 
-  /** Sends writes one at a time so a quick rate-then-undo reaches the server in order. */
+  /** Sends writes one at a time so quickly re-rating an item reaches the server in order. */
   const enqueueRequest = useCallback(
     (send: () => Promise<void>) => {
       requestChainRef.current = requestChainRef.current.then(send).catch((error: unknown) => {
@@ -236,11 +241,7 @@ export default function MediaReviewApp() {
       const [item, ...rest] = pendingRef.current;
       if (!item) return;
       commitPending(rest);
-      commitHistory(
-        [...historyRef.current, { item, previous: item.rating, next: rating }].slice(
-          -HISTORY_LIMIT,
-        ),
-      );
+      commitHistory([...historyRef.current, { item, rating }].slice(-HISTORY_LIMIT));
       reviewedRef.current.add(item.sha256);
       setStats((current) => adjustStats(current, item.rating, rating));
       resetDrag();
@@ -249,19 +250,19 @@ export default function MediaReviewApp() {
     [commitHistory, commitPending, enqueueRequest, resetDrag],
   );
 
-  const undo = useCallback(() => {
+  /**
+   * Shows the previously rated item again. Its saved rating is kept (and shown in the
+   * caption); rating it again simply overwrites it, so going back never loses data.
+   */
+  const goBack = useCallback(() => {
     const entry = historyRef.current.at(-1);
     if (!entry) return;
-    const { item, previous, next } = entry;
+    const item: QueueItem = { ...entry.item, rating: entry.rating };
     commitHistory(historyRef.current.slice(0, -1));
     commitPending([item, ...pendingRef.current.filter((other) => other.sha256 !== item.sha256)]);
     reviewedRef.current.delete(item.sha256);
-    setStats((current) => adjustStats(current, next, previous));
     resetDrag();
-    enqueueRequest(() =>
-      previous === null ? deleteRating(item.sha256) : putRating(item.sha256, previous),
-    );
-  }, [commitHistory, commitPending, enqueueRequest, resetDrag]);
+  }, [commitHistory, commitPending, resetDrag]);
 
   const toggleVideo = useCallback(() => {
     const video = videoRef.current;
@@ -293,7 +294,7 @@ export default function MediaReviewApp() {
       if (event.metaKey || event.ctrlKey) {
         if (event.key.toLowerCase() === "z") {
           event.preventDefault();
-          undo();
+          goBack();
         }
         return;
       }
@@ -303,7 +304,7 @@ export default function MediaReviewApp() {
         decide(rating);
       } else if (event.key === "Backspace") {
         event.preventDefault();
-        undo();
+        goBack();
       } else if (event.code === "Space" && !isControlTarget(event.target)) {
         event.preventDefault();
         toggleVideo();
@@ -311,7 +312,7 @@ export default function MediaReviewApp() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [decide, toggleVideo, undo]);
+  }, [decide, goBack, toggleVideo]);
 
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0 || isControlTarget(event.target)) return;
@@ -341,7 +342,7 @@ export default function MediaReviewApp() {
 
   const onModeChange = (event: ChangeEvent<HTMLSelectElement>) => {
     // Drop the previous mode's queue at once (and ignore refreshes still in flight),
-    // so keys or undo cannot act on items that are no longer on screen.
+    // so keys or going back cannot act on items that are no longer on screen.
     generationRef.current += 1;
     commitPending([]);
     commitHistory([]);
@@ -381,14 +382,6 @@ export default function MediaReviewApp() {
               ))}
             </select>
           </label>
-          <button
-            type="button"
-            className="header-button"
-            onClick={undo}
-            disabled={historyLength === 0}
-          >
-            取り消し
-          </button>
           <a className="header-button" href="/api/export.csv" download>
             CSV
           </a>
@@ -499,6 +492,19 @@ export default function MediaReviewApp() {
             </div>
           </main>
           <nav className="rating-bar" aria-label="評価">
+            <button
+              type="button"
+              className="back-button"
+              aria-keyshortcuts="Backspace"
+              disabled={historyLength === 0}
+              onClick={(event) => {
+                releasePointerFocus(event);
+                goBack();
+              }}
+            >
+              <span aria-hidden="true">↩</span>
+              戻る
+            </button>
             {BUTTON_ORDER.map((rating) => (
               <button
                 key={rating}
@@ -506,9 +512,7 @@ export default function MediaReviewApp() {
                 className={`rating-button ${rating}`}
                 aria-keyshortcuts={RATING_KEYS[rating]}
                 onClick={(event) => {
-                  // After a mouse/touch click, a focused button would turn a later
-                  // Space (meant to pause a video) into another rating.
-                  if (event.detail > 0) event.currentTarget.blur();
+                  releasePointerFocus(event);
                   decide(rating);
                 }}
               >
@@ -517,7 +521,7 @@ export default function MediaReviewApp() {
               </button>
             ))}
           </nav>
-          <p className="shortcut-hint">← バツ ・ ↓ 保留 ・ → マル ・ Backspace で取り消し</p>
+          <p className="shortcut-hint">← バツ ・ ↓ 保留 ・ → マル ・ Backspace で1枚戻る</p>
         </>
       ) : (
         <main className="center-shell">
@@ -528,6 +532,13 @@ export default function MediaReviewApp() {
             {mode === "hold" ? "保留はありません" : "評価待ちはありません"}
           </h1>
           <p className="state-copy">新しい画像・動画が届いていないか、30秒ごとに確認しています。</p>
+          {historyLength > 0 ? (
+            <div className="state-actions">
+              <button type="button" className="secondary-action" onClick={goBack}>
+                ↩ 1枚戻る
+              </button>
+            </div>
+          ) : null}
         </main>
       )}
 
